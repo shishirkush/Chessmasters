@@ -1,0 +1,23 @@
+﻿# Dependencies
+node_modules/
+functions/node_modules/
+
+# Compiled output
+functions/lib/
+
+# Firebase
+.firebase/
+*-debug.log
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+
+# Flutter
+app/.dart_tool/
+app/build/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+
+# Secrets / config not for git
+app/android/app/google-services.json
+**/firebase_options.dart
