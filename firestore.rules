@@ -1,0 +1,30 @@
+rules_version = '2';
+
+// SECURITY MODEL FOR SLICE 1
+// -------------------------------------------------------------
+// The whole integrity of the game rests here: clients may READ
+// games but may NEVER write to them. All writes happen through
+// Cloud Functions using the Admin SDK, which BYPASSES these rules.
+// So even a fully modified Flutter app cannot fake a move, flip a
+// turn, or declare itself the winner — it has no write path.
+//
+// When CP / money is added later, the same principle protects
+// balances: ledgers will be function-write-only too.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /games/{gameId} {
+      // A signed-in user may read a game if they are one of its players,
+      // OR if it is still waiting (so quick-match can discover open games).
+      allow read: if request.auth != null
+                  && (
+                       resource.data.status == 'waiting'
+                       || request.auth.uid in resource.data.players
+                     );
+
+      // No client writes, ever. Cloud Functions (Admin SDK) handle all writes.
+      allow write: if false;
+    }
+  }
+}
