@@ -386,3 +386,9 @@ export const resign = functions.https.onCall(async (data, context) => {
     return { ok: true, result: winner };
   });
 });
+
+// ---- Slice 2b: user profiles + rating -------------------------------------
+// Profile creation trigger (onUserCreate) and rating helpers live in their
+// own modules to keep this engine file focused. Re-exported here so the
+// Functions runtime discovers and deploys them.
+export { onUserCreate } from "./users";

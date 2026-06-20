@@ -26,5 +26,16 @@ service cloud.firestore {
       // No client writes, ever. Cloud Functions (Admin SDK) handle all writes.
       allow write: if false;
     }
+
+    // SLICE 2b: user profiles.
+    // Any signed-in user may READ any profile — needed to show opponent
+    // names, avatars, and (later) leaderboards. Profiles are created and
+    // updated ONLY by Cloud Functions (the onUserCreate trigger and the
+    // rating-update logic), so clients have no write path. This keeps
+    // rating a server-owned, untamperable, skill-only quantity.
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
   }
 }
