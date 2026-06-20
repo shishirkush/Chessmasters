@@ -105,4 +105,69 @@ class GameService {
   Stream<DocumentSnapshot<Map<String, dynamic>>> gameStream(String gameId) {
     return _db.collection('games').doc(gameId).snapshots();
   }
+
+  // ---- Slice 2c: circles ---------------------------------------------------
+
+  /// Create a circle owned by the current user. Returns the new circle id.
+  /// Throws FirebaseFunctionsException (e.g. 'failed-precondition' if the user
+  /// already owns a circle).
+  Future<String> createCircle(String name) async {
+    final res = await _fns
+        .httpsCallable('createCircle')
+        .call(<String, dynamic>{'name': name});
+    return res.data['circleId'] as String;
+  }
+
+  /// Leave a circle (owner cannot leave their own).
+  Future<void> leaveCircle(String circleId) async {
+    await _fns
+        .httpsCallable('leaveCircle')
+        .call(<String, dynamic>{'circleId': circleId});
+  }
+
+  /// Delete a circle (owner only).
+  Future<void> deleteCircle(String circleId) async {
+    await _fns
+        .httpsCallable('deleteCircle')
+        .call(<String, dynamic>{'circleId': circleId});
+  }
+
+  /// Live view of the current user's profile (rating, ownedCircleId, etc.).
+  Stream<DocumentSnapshot<Map<String, dynamic>>> myProfileStream() {
+    final id = uid;
+    return _db.collection('users').doc(id).snapshots();
+  }
+
+  /// Live view of a single circle document.
+  Stream<DocumentSnapshot<Map<String, dynamic>>> circleStream(String circleId) {
+    return _db.collection('circles').doc(circleId).snapshots();
+  }
+
+  /// Live list of circles the current user is a member of.
+  Stream<QuerySnapshot<Map<String, dynamic>>> myCirclesStream() {
+    final id = uid;
+    return _db
+        .collection('circles')
+        .where('members', arrayContains: id)
+        .snapshots();
+  }
+
+  /// One-off fetch of multiple user profiles (e.g. to show a circle's member
+  /// list with names + ratings for the crown). Firestore 'in' queries are
+  /// capped at 10 ids per call, so we batch.
+  Future<List<Map<String, dynamic>>> fetchProfiles(List<String> uids) async {
+    final results = <Map<String, dynamic>>[];
+    for (var i = 0; i < uids.length; i += 10) {
+      final batch = uids.sublist(i, i + 10 > uids.length ? uids.length : i + 10);
+      if (batch.isEmpty) continue;
+      final snap = await _db
+          .collection('users')
+          .where(FieldPath.documentId, whereIn: batch)
+          .get();
+      for (final doc in snap.docs) {
+        results.add({'uid': doc.id, ...doc.data()});
+      }
+    }
+    return results;
+  }
 }

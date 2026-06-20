@@ -202,6 +202,16 @@ class _HomeScreenState extends State<HomeScreen> {
               icon: const Icon(Icons.play_arrow),
               label: const Text('Quick Match'),
             ),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: _busy
+                  ? null
+                  : () => Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => CirclesScreen(service: _service),
+                      )),
+              icon: const Icon(Icons.groups),
+              label: const Text('Circles'),
+            ),
             const SizedBox(height: 16),
             if (_busy) const CircularProgressIndicator(),
             if (_status != null) ...[
@@ -577,5 +587,309 @@ class _ClockBar extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+// =============================================================================
+// SLICE 2c: Circles
+// =============================================================================
+
+/// Lists the circles the user belongs to, distinguishes the one they own,
+/// and lets them create a circle (if they don't already own one).
+class CirclesScreen extends StatelessWidget {
+  final GameService service;
+  const CirclesScreen({super.key, required this.service});
+
+  Future<void> _createCircle(BuildContext context) async {
+    final controller = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Create a circle'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: 40,
+          decoration: const InputDecoration(
+            hintText: 'Circle name',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text('Create'),
+          ),
+        ],
+      ),
+    );
+    if (name == null || name.isEmpty) return;
+    try {
+      await service.createCircle(name);
+      if (context.mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Created "$name"')));
+      }
+    } on FirebaseFunctionsException catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(e.message ?? 'Failed')));
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Circles')),
+      body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+        stream: service.myProfileStream(),
+        builder: (context, profileSnap) {
+          final ownedCircleId =
+              profileSnap.data?.data()?['ownedCircleId'] as String?;
+          return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: service.myCirclesStream(),
+            builder: (context, circlesSnap) {
+              if (circlesSnap.connectionState == ConnectionState.waiting) {
+                return const Center(child: CircularProgressIndicator());
+              }
+              final docs = circlesSnap.data?.docs ?? [];
+              return Column(
+                children: [
+                  Expanded(
+                    child: docs.isEmpty
+                        ? const Center(
+                            child: Padding(
+                              padding: EdgeInsets.all(32),
+                              child: Text(
+                                "You're not in any circles yet.\n"
+                                'Create one below, or search to join (coming soon).',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(color: Colors.black54),
+                              ),
+                            ),
+                          )
+                        : ListView.builder(
+                            itemCount: docs.length,
+                            itemBuilder: (context, i) {
+                              final c = docs[i].data();
+                              final id = docs[i].id;
+                              final isOwner = id == ownedCircleId;
+                              final count = (c['memberCount'] ?? 0) as int;
+                              return ListTile(
+                                leading: const Icon(Icons.groups),
+                                title: Text(c['name'] as String? ?? 'Circle'),
+                                subtitle: Text(
+                                    '$count member${count == 1 ? '' : 's'}'),
+                                trailing: isOwner
+                                    ? const Chip(
+                                        label: Text('Owner'),
+                                        visualDensity: VisualDensity.compact,
+                                      )
+                                    : null,
+                                onTap: () =>
+                                    Navigator.of(context).push(MaterialPageRoute(
+                                  builder: (_) => CircleDetailScreen(
+                                    service: service,
+                                    circleId: id,
+                                  ),
+                                )),
+                              );
+                            },
+                          ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: ownedCircleId == null
+                        ? FilledButton.icon(
+                            onPressed: () => _createCircle(context),
+                            icon: const Icon(Icons.add),
+                            label: const Text('Create a circle'),
+                          )
+                        : const Text(
+                            'You already own a circle (one per account).',
+                            style: TextStyle(color: Colors.black54),
+                          ),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// Shows a circle's members sorted by rating (top = crown holder), and
+/// lets a member leave or the owner delete.
+class CircleDetailScreen extends StatelessWidget {
+  final GameService service;
+  final String circleId;
+  const CircleDetailScreen({
+    super.key,
+    required this.service,
+    required this.circleId,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final myUid = service.uid;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Circle')),
+      body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+        stream: service.circleStream(circleId),
+        builder: (context, snap) {
+          if (snap.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          final data = snap.data?.data();
+          if (data == null) {
+            return const Center(child: Text('This circle no longer exists.'));
+          }
+          final name = data['name'] as String? ?? 'Circle';
+          final ownerId = data['ownerId'] as String?;
+          final members =
+              (data['members'] as List?)?.cast<String>() ?? <String>[];
+          final isOwner = myUid == ownerId;
+
+          return FutureBuilder<List<Map<String, dynamic>>>(
+            future: service.fetchProfiles(members),
+            builder: (context, profSnap) {
+              if (!profSnap.hasData) {
+                return const Center(child: CircularProgressIndicator());
+              }
+              final profiles = [...profSnap.data!];
+              // Sort by rating descending — top is the crown holder.
+              profiles.sort((a, b) =>
+                  ((b['rating'] ?? 0) as num).compareTo((a['rating'] ?? 0) as num));
+
+              return Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(name,
+                            style: const TextStyle(
+                                fontSize: 22, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 4),
+                        Text('${members.length} member'
+                            '${members.length == 1 ? '' : 's'}',
+                            style: const TextStyle(color: Colors.black54)),
+                      ],
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  Expanded(
+                    child: ListView.builder(
+                      itemCount: profiles.length,
+                      itemBuilder: (context, i) {
+                        final p = profiles[i];
+                        final isCrown = i == 0; // highest-rated holds the crown
+                        final isThisOwner = p['uid'] == ownerId;
+                        final rating = (p['rating'] ?? 1500).round();
+                        return ListTile(
+                          leading: CircleAvatar(
+                            child: Text('${i + 1}'),
+                          ),
+                          title: Row(
+                            children: [
+                              Flexible(
+                                child: Text(
+                                  p['displayName'] as String? ?? 'Player',
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              if (isCrown) ...[
+                                const SizedBox(width: 6),
+                                const Icon(Icons.emoji_events,
+                                    size: 18, color: Colors.amber),
+                              ],
+                            ],
+                          ),
+                          subtitle: Text(isThisOwner ? 'Owner' : ''),
+                          trailing: Text('$rating',
+                              style: const TextStyle(
+                                  fontWeight: FontWeight.bold)),
+                        );
+                      },
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: isOwner
+                        ? OutlinedButton.icon(
+                            style: OutlinedButton.styleFrom(
+                                foregroundColor: Colors.red),
+                            icon: const Icon(Icons.delete_outline),
+                            label: const Text('Delete circle'),
+                            onPressed: () async {
+                              final ok = await _confirm(context,
+                                  'Delete "$name"? This cannot be undone.');
+                              if (!ok) return;
+                              try {
+                                await service.deleteCircle(circleId);
+                                if (context.mounted) Navigator.of(context).pop();
+                              } on FirebaseFunctionsException catch (e) {
+                                if (context.mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                          content: Text(e.message ?? 'Failed')));
+                                }
+                              }
+                            },
+                          )
+                        : OutlinedButton.icon(
+                            icon: const Icon(Icons.exit_to_app),
+                            label: const Text('Leave circle'),
+                            onPressed: () async {
+                              final ok = await _confirm(
+                                  context, 'Leave "$name"?');
+                              if (!ok) return;
+                              try {
+                                await service.leaveCircle(circleId);
+                                if (context.mounted) Navigator.of(context).pop();
+                              } on FirebaseFunctionsException catch (e) {
+                                if (context.mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                          content: Text(e.message ?? 'Failed')));
+                                }
+                              }
+                            },
+                          ),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+
+  Future<bool> _confirm(BuildContext context, String message) async {
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        content: Text(message),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Confirm')),
+        ],
+      ),
+    );
+    return result ?? false;
   }
 }

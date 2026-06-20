@@ -37,5 +37,15 @@ service cloud.firestore {
       allow read: if request.auth != null;
       allow write: if false;
     }
+
+    // SLICE 2c: circles (social spaces).
+    // Readable by any signed-in user (needed for search/browse in 2d and to
+    // view membership). Created/modified/deleted ONLY by Cloud Functions
+    // (createCircle / leaveCircle / deleteCircle), so clients can't forge
+    // membership, seize ownership, or tamper with the member list.
+    match /circles/{circleId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
   }
 }
