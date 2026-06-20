@@ -15,7 +15,7 @@ dependencies:
   cloud_firestore: ^4.15.8
   cloud_functions: ^4.6.8
   # Board rendering only. Move LEGALITY is decided by the server, never here.
-  flutter_chess_board: ^1.0.6
+  simple_chess_board: ^1.9.0
   # Used purely to turn server FEN into a board the widget can show.
   chess: ^0.8.1
 

@@ -5,7 +5,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_chess_board/flutter_chess_board.dart';
+import 'package:simple_chess_board/simple_chess_board.dart';
 
 import 'game_service.dart';
 
@@ -126,8 +126,11 @@ class GameScreen extends StatefulWidget {
 }
 
 class _GameScreenState extends State<GameScreen> {
-  final ChessBoardController _controller = ChessBoardController();
-  String _lastAppliedFen = '';
+  // The board is driven directly by the SERVER's FEN string. We keep the
+  // latest authoritative FEN here and hand it to SimpleChessBoard. The widget
+  // never decides legality — it only displays this FEN and reports move intents.
+  String _currentFen =
+      'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
   bool _sending = false;
 
   // ---- Local display clock (server stays authoritative) ----
@@ -222,18 +225,25 @@ class _GameScreenState extends State<GameScreen> {
           final iAmBlack = myUid == blackId;
           final myTurn = (turn == 'w' && iAmWhite) || (turn == 'b' && iAmBlack);
 
-          // Sync the board widget to the SERVER's FEN whenever it changes.
-          if (fen != _lastAppliedFen) {
-            _lastAppliedFen = fen;
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              _controller.loadFen(fen);
-            });
-          }
+          // Track the SERVER's FEN as the source of truth for the board.
+          _currentFen = fen;
 
           // Keep the local display ticker aware of the active game so it can
           // count down the side-to-move's clock for display and, if the
           // OPPONENT runs out / abandons, prompt the server to resolve it.
           _trackClock(status, turn, myTurn);
+
+          // Player-type gate: a side is "human" (movable) only if it's MY
+          // colour AND it's my turn AND the game is active and I'm not mid-send.
+          // Everything else is "computer" (locked). The server also enforces
+          // turn/legality — this is the client-side belt-and-braces.
+          final canMove = status == 'active' && myTurn && !_sending;
+          final whiteType = (iAmWhite && canMove)
+              ? PlayerType.human
+              : PlayerType.computer;
+          final blackType = (iAmBlack && canMove)
+              ? PlayerType.human
+              : PlayerType.computer;
 
           return Column(
             children: [
@@ -255,16 +265,29 @@ class _GameScreenState extends State<GameScreen> {
               ),
               Expanded(
                 child: Center(
-                  child: AbsorbPointer(
-                    // Block interaction unless it is genuinely my turn.
-                    // (The server also enforces this — belt and braces.)
-                    absorbing: !(status == 'active' && myTurn) || _sending,
-                    child: ChessBoard(
-                      controller: _controller,
-                      boardOrientation:
-                          iAmBlack ? PlayerColor.black : PlayerColor.white,
-                      onMove: () => _onLocalMove(g),
-                    ),
+                  child: SimpleChessBoard(
+                    fen: _currentFen,
+                    blackSideAtBottom: iAmBlack,
+                    whitePlayerType: whiteType,
+                    blackPlayerType: blackType,
+                    engineThinking: false,
+                    onMove: ({required ShortMove move}) =>
+                        _onLocalMove(move),
+                    onPromote: () async => PieceType.queen,
+                    onPromotionCommited: ({
+                      required ShortMove moveDone,
+                      required PieceType pieceType,
+                    }) {
+                      // Promotion is sent to the server as part of the move;
+                      // nothing to update locally (server returns new FEN).
+                    },
+                    // Required by the widget; we don't need custom tap
+                    // behaviour (moves go through onMove), so this is a no-op.
+                    onTap: ({required String cellCoordinate}) {},
+                    // Required: which squares to tint. We highlight none.
+                    cellHighlights: const <String, Color>{},
+                    chessBoardColors: ChessBoardColors()
+                      ..lastMoveArrowColor = Colors.blueAccent,
                   ),
                 ),
               ),
@@ -280,18 +303,34 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
-  /// The board widget made a tentative local move. We DO NOT trust it as
-  /// truth — we extract from/to, send the intent to the server, and let the
-  /// authoritative FEN come back through the stream. If the server rejects
-  /// it, we reload the last good FEN.
-  Future<void> _onLocalMove(Map<String, dynamic> g) async {
+  /// The board reported a tentative move (ShortMove from simple_chess_board).
+  /// We DO NOT trust it as truth — we send from/to (+promotion) to the server
+  /// and let the authoritative FEN come back through the stream. If the server
+  /// rejects it, the stream simply keeps the last good FEN (the board re-renders
+  /// from _currentFen, which we never advanced locally).
+  Future<void> _onLocalMove(ShortMove move) async {
     if (_sending) return;
-    final history = _controller.game.getHistory({'verbose': true});
-    if (history.isEmpty) return;
-    final last = history.last as Map;
-    final from = last['from'] as String;
-    final to = last['to'] as String;
-    final promo = last['promotion'] as String?; // 'q','r','b','n' or null
+    final from = move.from;
+    final to = move.to;
+    // simple_chess_board's promotion is a PieceType?; the server expects a
+    // single-char string ('q','r','b','n') or null.
+    String? promo;
+    switch (move.promotion) {
+      case PieceType.queen:
+        promo = 'q';
+        break;
+      case PieceType.rook:
+        promo = 'r';
+        break;
+      case PieceType.bishop:
+        promo = 'b';
+        break;
+      case PieceType.knight:
+        promo = 'n';
+        break;
+      default:
+        promo = null;
+    }
 
     setState(() => _sending = true);
     try {
@@ -301,10 +340,11 @@ class _GameScreenState extends State<GameScreen> {
         to: to,
         promotion: promo,
       );
-      // Success: the stream will deliver the new authoritative FEN.
+      // Success: the stream will deliver the new authoritative FEN, which
+      // re-renders the board. We never advanced the board locally.
     } on FirebaseFunctionsException catch (e) {
-      // Rejected by server — snap board back to the last good state.
-      _controller.loadFen(_lastAppliedFen);
+      // Rejected by server — the board stays on the last good FEN (_currentFen
+      // was not changed locally), so nothing to roll back. Just inform the user.
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Move rejected: ${e.message}')),

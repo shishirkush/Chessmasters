@@ -18,6 +18,10 @@
 
 import * as functions from "firebase-functions/v1";
 import * as admin from "firebase-admin";
+// Import FieldValue directly — the admin.firestore.FieldValue static path
+// can be undefined depending on the firebase-admin version, which caused
+// "Cannot read properties of undefined (reading 'serverTimestamp')".
+import { FieldValue } from "firebase-admin/firestore";
 import { Chess } from "chess.js";
 
 admin.initializeApp();
@@ -71,8 +75,8 @@ interface GameDoc {
   lastMoveAt: number | null;  // server epoch ms when the current turn began
   result: Result;
   resultReason: string | null; // checkmate|stalemate|draw|resign|timeout|abandon
-  createdAt: admin.firestore.FieldValue;
-  updatedAt: admin.firestore.FieldValue;
+  createdAt: any; // FieldValue sentinel
+  updatedAt: any; // FieldValue sentinel
 }
 
 // ---- Helpers ---------------------------------------------------------------
@@ -118,8 +122,8 @@ function freshGame(uid: string, gameType: GameType, contextId: string | null): G
     lastMoveAt: null, // set when the game becomes active
     result: null,
     resultReason: null,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
   };
 }
 
@@ -192,9 +196,9 @@ export const joinGame = functions.https.onCall(async (data, context) => {
     tx.update(ref, {
       status: "active",
       blackId: uid,
-      players: admin.firestore.FieldValue.arrayUnion(uid),
+      players: FieldValue.arrayUnion(uid),
       lastMoveAt: now(), // white's clock starts now
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
     });
     return { gameId: ref.id, joined: true, waiting: false };
   });
@@ -242,7 +246,7 @@ export const makeMove = functions.https.onCall(async (data, context) => {
         resultReason: "timeout",
         whiteMs: sideToMove === "w" ? 0 : g.whiteMs,
         blackMs: sideToMove === "b" ? 0 : g.blackMs,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
       });
       throw new functions.https.HttpsError(
         "deadline-exceeded",
@@ -262,12 +266,12 @@ export const makeMove = functions.https.onCall(async (data, context) => {
 
     const update: Partial<GameDoc> = {
       fen: chess.fen(),
-      moves: admin.firestore.FieldValue.arrayUnion(move.san) as any,
+      moves: FieldValue.arrayUnion(move.san) as any,
       turn: chess.turn(),
       whiteMs: sideToMove === "w" ? newRemaining : g.whiteMs,
       blackMs: sideToMove === "b" ? newRemaining : g.blackMs,
       lastMoveAt: now(), // opponent's clock starts now
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
     };
     if (outcome) {
       update.status = "finished";
@@ -327,7 +331,7 @@ export const claimTimeout = functions.https.onCall(async (data, context) => {
         whiteMs: g.turn === "w" ? 0 : g.whiteMs,
         blackMs: g.turn === "b" ? 0 : g.blackMs,
         lastMoveAt: null,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
       });
       return { resolved: true, result: winner, reason: "timeout" };
     }
@@ -342,7 +346,7 @@ export const claimTimeout = functions.https.onCall(async (data, context) => {
         result: winner,
         resultReason: "abandon",
         lastMoveAt: null,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
       });
       return { resolved: true, result: winner, reason: "abandon" };
     }
@@ -377,7 +381,7 @@ export const resign = functions.https.onCall(async (data, context) => {
       result: winner,
       resultReason: "resign",
       lastMoveAt: null,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
     });
     return { ok: true, result: winner };
   });
