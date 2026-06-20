@@ -14,7 +14,12 @@ dependencies:
   firebase_auth: ^4.17.8
   cloud_firestore: ^4.15.8
   cloud_functions: ^4.6.8
+  # Google Sign-In (6.x classic API, pairs with firebase_auth 4.x):
+  # GoogleSignIn().signIn() -> authentication -> GoogleAuthProvider.credential.
+  google_sign_in: ^6.2.1
   # Board rendering only. Move LEGALITY is decided by the server, never here.
+  # simple_chess_board is display-only (does NOT enforce rules) which is the
+  # correct fit for our server-authoritative design.
   simple_chess_board: ^1.9.0
   # Used purely to turn server FEN into a board the widget can show.
   chess: ^0.8.1

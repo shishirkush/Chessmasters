@@ -37,30 +37,128 @@ class ChessMastersApp extends StatelessWidget {
         useMaterial3: true,
         colorSchemeSeed: const Color(0xFF3B5B92),
       ),
-      home: const HomeScreen(),
+      home: const AuthGate(),
+    );
+  }
+}
+
+/// Watches Firebase auth state and shows either the sign-in screen (when
+/// signed out) or the home screen (when signed in). Because we listen to
+/// authStateChanges(), the app automatically routes correctly on launch
+/// (Firebase restores the previous session) and on sign-in/sign-out.
+class AuthGate extends StatelessWidget {
+  const AuthGate({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final service = GameService();
+    return StreamBuilder<User?>(
+      stream: service.authStateChanges(),
+      builder: (context, snap) {
+        if (snap.connectionState == ConnectionState.waiting) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
+        final user = snap.data;
+        if (user == null) {
+          return SignInScreen(service: service);
+        }
+        return HomeScreen(service: service);
+      },
+    );
+  }
+}
+
+/// Sign-in screen — a single "Sign in with Google" button.
+class SignInScreen extends StatefulWidget {
+  final GameService service;
+  const SignInScreen({super.key, required this.service});
+  @override
+  State<SignInScreen> createState() => _SignInScreenState();
+}
+
+class _SignInScreenState extends State<SignInScreen> {
+  bool _busy = false;
+  String? _error;
+
+  Future<void> _signIn() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await widget.service.signInWithGoogle();
+      // On success, the AuthGate's stream fires and routes to HomeScreen.
+      // (No navigation needed here.)
+    } on FirebaseAuthException catch (e) {
+      setState(() => _error = e.message ?? 'Sign-in failed.');
+    } catch (e) {
+      setState(() => _error = 'Sign-in failed: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.castle, size: 72),
+            const SizedBox(height: 8),
+            const Text('Chess Masters',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 4),
+            const Text('Sign in to play',
+                style: TextStyle(fontSize: 14, color: Colors.black54)),
+            const SizedBox(height: 32),
+            if (_busy)
+              const CircularProgressIndicator()
+            else
+              FilledButton.icon(
+                onPressed: _signIn,
+                icon: const Icon(Icons.login),
+                label: const Text('Sign in with Google'),
+              ),
+            if (_error != null) ...[
+              const SizedBox(height: 16),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 32),
+                child: Text(_error!,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.red)),
+              ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 }
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  final GameService service;
+  const HomeScreen({super.key, required this.service});
   @override
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  final _service = GameService();
+  GameService get _service => widget.service;
   bool _busy = false;
   String? _status;
 
   Future<void> _quickMatch() async {
     setState(() {
       _busy = true;
-      _status = 'Signing in…';
+      _status = 'Finding a game…';
     });
     try {
-      await _service.ensureSignedIn();
-      setState(() => _status = 'Finding a game…');
+      // User is already signed in (the AuthGate guarantees it), so we go
+      // straight to matchmaking — no ensureSignedIn() needed.
       final gameId = await _service.quickMatch();
       if (!mounted) return;
       Navigator.of(context).push(MaterialPageRoute(
@@ -77,16 +175,27 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final user = _service.currentUser;
+    final name = user?.displayName ?? user?.email ?? 'Player';
     return Scaffold(
-      appBar: AppBar(title: const Text('Chess Masters')),
+      appBar: AppBar(
+        title: const Text('Chess Masters'),
+        actions: [
+          IconButton(
+            tooltip: 'Sign out',
+            icon: const Icon(Icons.logout),
+            onPressed: () => _service.signOut(),
+          ),
+        ],
+      ),
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             const Icon(Icons.castle, size: 72),
             const SizedBox(height: 8),
-            const Text('Live Chess — Slice 1',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+            Text('Signed in as $name',
+                style: const TextStyle(fontSize: 14, color: Colors.black54)),
             const SizedBox(height: 24),
             FilledButton.icon(
               onPressed: _busy ? null : _quickMatch,

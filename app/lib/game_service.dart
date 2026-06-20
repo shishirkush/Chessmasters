@@ -1,6 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 
 /// All backend contact lives here. The app sends INTENTS (callable
 /// functions) and READS state (Firestore stream). It never writes
@@ -9,14 +10,42 @@ class GameService {
   final _auth = FirebaseAuth.instance;
   final _db = FirebaseFirestore.instance;
   final _fns = FirebaseFunctions.instance;
+  final _googleSignIn = GoogleSignIn();
 
   String? get uid => _auth.currentUser?.uid;
+  User? get currentUser => _auth.currentUser;
 
-  /// Anonymous sign-in is enough for slice 1. Real accounts come later.
-  Future<void> ensureSignedIn() async {
-    if (_auth.currentUser == null) {
-      await _auth.signInAnonymously();
-    }
+  /// Stream of auth state — the app's auth gate listens to this to decide
+  /// whether to show the sign-in screen or the home screen.
+  Stream<User?> authStateChanges() => _auth.authStateChanges();
+
+  /// Sign in with Google. Returns the signed-in [User], or null if the user
+  /// cancelled. Throws FirebaseAuthException on a real failure.
+  ///
+  /// Flow (classic google_sign_in 6.x + firebase_auth 4.x):
+  ///   GoogleSignIn().signIn()  -> interactive account picker
+  ///   account.authentication   -> idToken + accessToken
+  ///   GoogleAuthProvider.credential(...) -> Firebase credential
+  ///   _auth.signInWithCredential(...)    -> Firebase user
+  Future<User?> signInWithGoogle() async {
+    final googleUser = await _googleSignIn.signIn();
+    if (googleUser == null) return null; // user cancelled the picker
+
+    final googleAuth = await googleUser.authentication;
+    final credential = GoogleAuthProvider.credential(
+      accessToken: googleAuth.accessToken,
+      idToken: googleAuth.idToken,
+    );
+
+    final result = await _auth.signInWithCredential(credential);
+    return result.user;
+  }
+
+  /// Sign out of both Firebase and Google (so the next sign-in re-prompts
+  /// for account choice rather than silently reusing the last account).
+  Future<void> signOut() async {
+    await _googleSignIn.signOut();
+    await _auth.signOut();
   }
 
   /// Quick match: join any open game, or create one and wait.
