@@ -392,3 +392,4 @@ export const resign = functions.https.onCall(async (data, context) => {
 // own modules to keep this engine file focused. Re-exported here so the
 // Functions runtime discovers and deploys them.
 export { onUserCreate } from "./users";
+export { onGameFinished } from "./rating";
