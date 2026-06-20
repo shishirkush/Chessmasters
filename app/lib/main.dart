@@ -645,7 +645,18 @@ class CirclesScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Circles')),
+      appBar: AppBar(
+        title: const Text('Circles'),
+        actions: [
+          IconButton(
+            tooltip: 'Search circles',
+            icon: const Icon(Icons.search),
+            onPressed: () => Navigator.of(context).push(MaterialPageRoute(
+              builder: (_) => SearchCirclesScreen(service: service),
+            )),
+          ),
+        ],
+      ),
       body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
         stream: service.myProfileStream(),
         builder: (context, profileSnap) {
@@ -764,9 +775,27 @@ class CircleDetailScreen extends StatelessWidget {
                 return const Center(child: CircularProgressIndicator());
               }
               final profiles = [...profSnap.data!];
-              // Sort by rating descending — top is the crown holder.
-              profiles.sort((a, b) =>
-                  ((b['rating'] ?? 0) as num).compareTo((a['rating'] ?? 0) as num));
+              // Crown order (design §10): highest-rated holds the crown.
+              // Tie-breakers for equal ratings (so the crown is stable, not
+              // arbitrary): a more *established* 1500 outranks a fresh one.
+              //   1) higher rating
+              //   2) lower RD (less uncertain = more proven)
+              //   3) more games played
+              //   4) uid (final deterministic fallback)
+              num n(Map<String, dynamic> p, String k, num fallback) =>
+                  (p[k] ?? fallback) as num;
+              profiles.sort((a, b) {
+                final byRating = n(b, 'rating', 0).compareTo(n(a, 'rating', 0));
+                if (byRating != 0) return byRating;
+                // lower RD ranks higher → compare a vs b (ascending)
+                final byRd = n(a, 'rd', 350).compareTo(n(b, 'rd', 350));
+                if (byRd != 0) return byRd;
+                final byGames =
+                    n(b, 'gamesPlayed', 0).compareTo(n(a, 'gamesPlayed', 0));
+                if (byGames != 0) return byGames;
+                return (a['uid'] as String? ?? '')
+                    .compareTo(b['uid'] as String? ?? '');
+              });
 
               return Column(
                 children: [
@@ -821,6 +850,12 @@ class CircleDetailScreen extends StatelessWidget {
                       },
                     ),
                   ),
+                  // Owner-only: pending join requests to approve/reject.
+                  if (isOwner)
+                    _PendingRequests(
+                      service: service,
+                      circleId: circleId,
+                    ),
                   const Divider(height: 1),
                   Padding(
                     padding: const EdgeInsets.all(16),
@@ -891,5 +926,254 @@ class CircleDetailScreen extends StatelessWidget {
       ),
     );
     return result ?? false;
+  }
+}
+
+// =============================================================================
+// SLICE 2d: Search circles + join requests
+// =============================================================================
+
+/// Search circles by name prefix and request to join.
+class SearchCirclesScreen extends StatefulWidget {
+  final GameService service;
+  const SearchCirclesScreen({super.key, required this.service});
+  @override
+  State<SearchCirclesScreen> createState() => _SearchCirclesScreenState();
+}
+
+class _SearchCirclesScreenState extends State<SearchCirclesScreen> {
+  final _controller = TextEditingController();
+  List<Map<String, dynamic>> _results = [];
+  bool _searching = false;
+  bool _searched = false;
+
+  Future<void> _runSearch() async {
+    final q = _controller.text.trim();
+    if (q.isEmpty) return;
+    setState(() => _searching = true);
+    try {
+      final r = await widget.service.searchCircles(q);
+      if (mounted) setState(() => _results = r);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Search failed: $e')));
+      }
+    } finally {
+      if (mounted) setState(() {
+        _searching = false;
+        _searched = true;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Find a circle')),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _controller,
+                    textInputAction: TextInputAction.search,
+                    onSubmitted: (_) => _runSearch(),
+                    decoration: const InputDecoration(
+                      hintText: 'Search circle name…',
+                      border: OutlineInputBorder(),
+                      prefixIcon: Icon(Icons.search),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: _searching ? null : _runSearch,
+                  child: const Text('Search'),
+                ),
+              ],
+            ),
+          ),
+          if (_searching) const LinearProgressIndicator(),
+          Expanded(
+            child: !_searched
+                ? const Center(
+                    child: Text('Search for a circle by name to join.',
+                        style: TextStyle(color: Colors.black54)),
+                  )
+                : _results.isEmpty
+                    ? const Center(
+                        child: Text('No circles found.',
+                            style: TextStyle(color: Colors.black54)),
+                      )
+                    : ListView.builder(
+                        itemCount: _results.length,
+                        itemBuilder: (context, i) {
+                          final c = _results[i];
+                          return _SearchResultTile(
+                            service: widget.service,
+                            circleId: c['circleId'] as String,
+                            name: c['name'] as String? ?? 'Circle',
+                            memberCount: (c['memberCount'] ?? 0) as int,
+                          );
+                        },
+                      ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// A single search result with a Join / Pending / Member button that reflects
+/// the user's live relationship to the circle.
+class _SearchResultTile extends StatelessWidget {
+  final GameService service;
+  final String circleId;
+  final String name;
+  final int memberCount;
+  const _SearchResultTile({
+    required this.service,
+    required this.circleId,
+    required this.name,
+    required this.memberCount,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final myUid = service.uid;
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: service.circleStream(circleId),
+      builder: (context, circleSnap) {
+        final members = (circleSnap.data?.data()?['members'] as List?)
+                ?.cast<String>() ??
+            <String>[];
+        final isMember = members.contains(myUid);
+
+        return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+          stream: service.myJoinRequestStream(circleId),
+          builder: (context, reqSnap) {
+            final isPending = reqSnap.data?.exists ?? false;
+
+            Widget trailing;
+            if (isMember) {
+              trailing = const Chip(label: Text('Member'));
+            } else if (isPending) {
+              trailing = OutlinedButton(
+                onPressed: () async {
+                  try {
+                    await service.cancelJoinRequest(circleId);
+                  } catch (_) {}
+                },
+                child: const Text('Pending'),
+              );
+            } else {
+              trailing = FilledButton(
+                onPressed: () async {
+                  try {
+                    await service.requestJoin(circleId);
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('Request sent')));
+                    }
+                  } on FirebaseFunctionsException catch (e) {
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(content: Text(e.message ?? 'Failed')));
+                    }
+                  }
+                },
+                child: const Text('Join'),
+              );
+            }
+
+            return ListTile(
+              leading: const Icon(Icons.groups),
+              title: Text(name),
+              subtitle: Text('$memberCount member'
+                  '${memberCount == 1 ? '' : 's'}'),
+              trailing: trailing,
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+/// Owner-only widget: lists pending join requests with Approve / Reject.
+class _PendingRequests extends StatelessWidget {
+  final GameService service;
+  final String circleId;
+  const _PendingRequests({required this.service, required this.circleId});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: service.joinRequestsStream(circleId),
+      builder: (context, snap) {
+        final docs = snap.data?.docs ?? [];
+        if (docs.isEmpty) return const SizedBox.shrink();
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+              child: Text('Pending requests (${docs.length})',
+                  style: const TextStyle(
+                      fontWeight: FontWeight.bold, color: Colors.black87)),
+            ),
+            ...docs.map((d) {
+              final r = d.data();
+              final applicantUid = d.id;
+              final rating = (r['rating'] ?? 1500).round();
+              return ListTile(
+                dense: true,
+                leading: const Icon(Icons.person_add_alt),
+                title: Text(r['displayName'] as String? ?? 'Player'),
+                subtitle: Text('Rating $rating'),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      tooltip: 'Approve',
+                      icon: const Icon(Icons.check, color: Colors.green),
+                      onPressed: () async {
+                        try {
+                          await service.approveJoin(circleId, applicantUid);
+                        } on FirebaseFunctionsException catch (e) {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(content: Text(e.message ?? 'Failed')));
+                          }
+                        }
+                      },
+                    ),
+                    IconButton(
+                      tooltip: 'Reject',
+                      icon: const Icon(Icons.close, color: Colors.red),
+                      onPressed: () async {
+                        try {
+                          await service.rejectJoin(circleId, applicantUid);
+                        } on FirebaseFunctionsException catch (e) {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(content: Text(e.message ?? 'Failed')));
+                          }
+                        }
+                      },
+                    ),
+                  ],
+                ),
+              );
+            }),
+          ],
+        );
+      },
+    );
   }
 }

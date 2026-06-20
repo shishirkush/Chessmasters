@@ -394,3 +394,9 @@ export const resign = functions.https.onCall(async (data, context) => {
 export { onUserCreate } from "./users";
 export { onGameFinished } from "./rating";
 export { createCircle, leaveCircle, deleteCircle } from "./circles";
+export {
+  requestJoin,
+  cancelJoinRequest,
+  approveJoin,
+  rejectJoin,
+} from "./circles";

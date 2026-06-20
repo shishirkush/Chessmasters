@@ -84,6 +84,7 @@ export const createCircle = functions.https.onCall(async (data, context) => {
 
     tx.set(circleRef, {
       name: rawName,
+      nameLower: rawName.toLowerCase(), // for case-insensitive prefix search
       ownerId: uid,
       members: [uid],
       memberCount: 1,
@@ -187,6 +188,185 @@ export const deleteCircle = functions.https.onCall(async (data, context) => {
       { ownedCircleId: null, updatedAt: FieldValue.serverTimestamp() },
       { merge: true }
     );
+  });
+
+  return { ok: true };
+});
+
+// ---- Slice 2d: search + join + owner approval -----------------------------
+
+/**
+ * Request to join a circle. Creates a pending join-request that the owner
+ * must approve. Keyed by uid so a user can't stack duplicate requests.
+ *
+ * Guards:
+ *  - must be signed in and have a profile,
+ *  - circle must exist,
+ *  - can't request to join a circle you're already in,
+ *  - re-requesting while already pending is a no-op (idempotent).
+ */
+export const requestJoin = functions.https.onCall(async (data, context) => {
+  const uid = requireAuth(context);
+  const circleId = typeof data?.circleId === "string" ? data.circleId : "";
+  if (!circleId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "circleId is required."
+    );
+  }
+
+  const circleRef = db.collection("circles").doc(circleId);
+  const reqRef = circleRef.collection("joinRequests").doc(uid);
+  const userRef = db.collection("users").doc(uid);
+
+  await db.runTransaction(async (tx) => {
+    const [circleSnap, userSnap] = await Promise.all([
+      tx.get(circleRef),
+      tx.get(userRef),
+    ]);
+    if (!circleSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Circle not found.");
+    }
+    if (!userSnap.exists) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Your profile is not set up yet. Try again in a moment."
+      );
+    }
+    const c = circleSnap.data()!;
+    const members: string[] = Array.isArray(c.members) ? c.members : [];
+    if (members.includes(uid)) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "You are already a member of this circle."
+      );
+    }
+
+    const u = userSnap.data()!;
+    // Snapshot the requester's display info so the owner sees who's asking
+    // without an extra lookup.
+    tx.set(reqRef, {
+      uid,
+      displayName: u.displayName ?? "Player",
+      photoURL: u.photoURL ?? null,
+      rating: u.rating ?? 1500,
+      status: "pending",
+      createdAt: FieldValue.serverTimestamp(),
+    });
+  });
+
+  return { ok: true };
+});
+
+/**
+ * Cancel your own pending join request.
+ */
+export const cancelJoinRequest = functions.https.onCall(
+  async (data, context) => {
+    const uid = requireAuth(context);
+    const circleId = typeof data?.circleId === "string" ? data.circleId : "";
+    if (!circleId) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "circleId is required."
+      );
+    }
+    await db
+      .collection("circles")
+      .doc(circleId)
+      .collection("joinRequests")
+      .doc(uid)
+      .delete();
+    return { ok: true };
+  }
+);
+
+/**
+ * Owner approves a pending request: adds the requester to members and removes
+ * the request. Only the circle owner may call this.
+ */
+export const approveJoin = functions.https.onCall(async (data, context) => {
+  const ownerUid = requireAuth(context);
+  const circleId = typeof data?.circleId === "string" ? data.circleId : "";
+  const applicantUid =
+    typeof data?.applicantUid === "string" ? data.applicantUid : "";
+  if (!circleId || !applicantUid) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "circleId and applicantUid are required."
+    );
+  }
+
+  const circleRef = db.collection("circles").doc(circleId);
+  const reqRef = circleRef.collection("joinRequests").doc(applicantUid);
+
+  await db.runTransaction(async (tx) => {
+    const circleSnap = await tx.get(circleRef);
+    if (!circleSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Circle not found.");
+    }
+    const c = circleSnap.data()!;
+    if (c.ownerId !== ownerUid) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "Only the owner can approve join requests."
+      );
+    }
+    const reqSnap = await tx.get(reqRef);
+    if (!reqSnap.exists) {
+      throw new functions.https.HttpsError(
+        "not-found",
+        "That join request no longer exists."
+      );
+    }
+    const members: string[] = Array.isArray(c.members) ? c.members : [];
+    if (members.includes(applicantUid)) {
+      // Already a member somehow — just clear the stale request.
+      tx.delete(reqRef);
+      return;
+    }
+
+    tx.update(circleRef, {
+      members: FieldValue.arrayUnion(applicantUid),
+      memberCount: (c.memberCount ?? members.length) + 1,
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+    tx.delete(reqRef);
+  });
+
+  return { ok: true };
+});
+
+/**
+ * Owner rejects a pending request: just removes it. Only the owner may call.
+ */
+export const rejectJoin = functions.https.onCall(async (data, context) => {
+  const ownerUid = requireAuth(context);
+  const circleId = typeof data?.circleId === "string" ? data.circleId : "";
+  const applicantUid =
+    typeof data?.applicantUid === "string" ? data.applicantUid : "";
+  if (!circleId || !applicantUid) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "circleId and applicantUid are required."
+    );
+  }
+
+  const circleRef = db.collection("circles").doc(circleId);
+  const reqRef = circleRef.collection("joinRequests").doc(applicantUid);
+
+  await db.runTransaction(async (tx) => {
+    const circleSnap = await tx.get(circleRef);
+    if (!circleSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Circle not found.");
+    }
+    if (circleSnap.data()!.ownerId !== ownerUid) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "Only the owner can reject join requests."
+      );
+    }
+    tx.delete(reqRef);
   });
 
   return { ok: true };

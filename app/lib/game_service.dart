@@ -170,4 +170,75 @@ class GameService {
     }
     return results;
   }
+
+  // ---- Slice 2d: search + join + owner approval ----------------------------
+
+  /// Search circles by name prefix (case-insensitive). Firestore has no
+  /// full-text search, so this is a prefix range query on a lowercased name
+  /// field: matches circles whose name starts with [query].
+  Future<List<Map<String, dynamic>>> searchCircles(String query) async {
+    final q = query.trim().toLowerCase();
+    if (q.isEmpty) return [];
+    // Prefix range trick: names in [q, q + '\uf8ff') all start with q.
+    final snap = await _db
+        .collection('circles')
+        .where('nameLower', isGreaterThanOrEqualTo: q)
+        .where('nameLower', isLessThan: '$q\uf8ff')
+        .limit(20)
+        .get();
+    return snap.docs.map((d) => {'circleId': d.id, ...d.data()}).toList();
+  }
+
+  /// Request to join a circle (creates a pending request for the owner).
+  Future<void> requestJoin(String circleId) async {
+    await _fns
+        .httpsCallable('requestJoin')
+        .call(<String, dynamic>{'circleId': circleId});
+  }
+
+  /// Cancel your own pending join request.
+  Future<void> cancelJoinRequest(String circleId) async {
+    await _fns
+        .httpsCallable('cancelJoinRequest')
+        .call(<String, dynamic>{'circleId': circleId});
+  }
+
+  /// Owner: approve a pending join request.
+  Future<void> approveJoin(String circleId, String applicantUid) async {
+    await _fns.httpsCallable('approveJoin').call(<String, dynamic>{
+      'circleId': circleId,
+      'applicantUid': applicantUid,
+    });
+  }
+
+  /// Owner: reject a pending join request.
+  Future<void> rejectJoin(String circleId, String applicantUid) async {
+    await _fns.httpsCallable('rejectJoin').call(<String, dynamic>{
+      'circleId': circleId,
+      'applicantUid': applicantUid,
+    });
+  }
+
+  /// Live list of pending join requests for a circle (owner view).
+  Stream<QuerySnapshot<Map<String, dynamic>>> joinRequestsStream(
+      String circleId) {
+    return _db
+        .collection('circles')
+        .doc(circleId)
+        .collection('joinRequests')
+        .snapshots();
+  }
+
+  /// Live view of the current user's own join request on a circle (to show
+  /// "pending" state on the search result). Returns null doc if none.
+  Stream<DocumentSnapshot<Map<String, dynamic>>> myJoinRequestStream(
+      String circleId) {
+    final id = uid;
+    return _db
+        .collection('circles')
+        .doc(circleId)
+        .collection('joinRequests')
+        .doc(id)
+        .snapshots();
+  }
 }

@@ -46,6 +46,22 @@ service cloud.firestore {
     match /circles/{circleId} {
       allow read: if request.auth != null;
       allow write: if false;
+
+      // SLICE 2d: join requests (subcollection).
+      // A signed-in user may read join requests on a circle if they are the
+      // circle's owner (to review pending requests) OR the request is their
+      // own (to see their pending status). All writes go through Cloud
+      // Functions (requestJoin / approveJoin / rejectJoin / cancelJoinRequest).
+      match /joinRequests/{applicantId} {
+        allow read: if request.auth != null
+                    && (
+                         request.auth.uid == applicantId
+                         || request.auth.uid == get(
+                              /databases/$(database)/documents/circles/$(circleId)
+                            ).data.ownerId
+                       );
+        allow write: if false;
+      }
     }
   }
 }
