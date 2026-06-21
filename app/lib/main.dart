@@ -227,6 +227,33 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
             const SizedBox(height: 24),
+            // Resume an in-progress game (e.g. a staked game created when an
+            // opponent accepted your offer — the issuer has no other way in).
+            StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: _service.activeGamesStream(),
+              builder: (context, snap) {
+                final docs = snap.data?.docs ?? [];
+                if (docs.isEmpty) return const SizedBox.shrink();
+                final gameId = docs.first.id;
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: FilledButton.icon(
+                    style: FilledButton.styleFrom(
+                        backgroundColor: Colors.green.shade700),
+                    onPressed: () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) =>
+                            GameScreen(gameId: gameId, service: _service),
+                      ),
+                    ),
+                    icon: const Icon(Icons.sports_esports),
+                    label: Text(docs.length > 1
+                        ? 'Resume game (${docs.length})'
+                        : 'Resume game'),
+                  ),
+                );
+              },
+            ),
             FilledButton.icon(
               onPressed: _busy ? null : _quickMatch,
               icon: const Icon(Icons.play_arrow),
@@ -883,6 +910,8 @@ class CircleDetailScreen extends StatelessWidget {
                         final isCrown = i == 0; // highest-rated holds the crown
                         final isThisOwner = p['uid'] == ownerId;
                         final rating = (p['rating'] ?? 1500).round();
+                        final memberUid = p['uid'] as String?;
+                        final isMe = memberUid == myUid;
                         return ListTile(
                           leading: CircleAvatar(
                             child: Text('${i + 1}'),
@@ -903,9 +932,33 @@ class CircleDetailScreen extends StatelessWidget {
                             ],
                           ),
                           subtitle: Text(isThisOwner ? 'Owner' : ''),
-                          trailing: Text('$rating',
-                              style: const TextStyle(
-                                  fontWeight: FontWeight.bold)),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text('$rating',
+                                  style: const TextStyle(
+                                      fontWeight: FontWeight.bold)),
+                              if (!isMe && memberUid != null) ...[
+                                const SizedBox(width: 8),
+                                OutlinedButton(
+                                  style: OutlinedButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 10),
+                                    visualDensity: VisualDensity.compact,
+                                  ),
+                                  onPressed: () => _showStakeDialog(
+                                    context,
+                                    service,
+                                    opponentId: memberUid,
+                                    opponentName:
+                                        p['displayName'] as String? ?? 'Player',
+                                    circleId: circleId,
+                                  ),
+                                  child: const Text('Stake'),
+                                ),
+                              ],
+                            ],
+                          ),
                         );
                       },
                     ),
@@ -916,6 +969,8 @@ class CircleDetailScreen extends StatelessWidget {
                       service: service,
                       circleId: circleId,
                     ),
+                  // Stake offers made to me (any member) — accept/decline.
+                  _IncomingStakes(service: service),
                   const Divider(height: 1),
                   Padding(
                     padding: const EdgeInsets.all(16),
@@ -1219,6 +1274,179 @@ class _PendingRequests extends StatelessWidget {
                       onPressed: () async {
                         try {
                           await service.rejectJoin(circleId, applicantUid);
+                        } on FirebaseFunctionsException catch (e) {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(content: Text(e.message ?? 'Failed')));
+                          }
+                        }
+                      },
+                    ),
+                  ],
+                ),
+              );
+            }),
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// Dialog to propose a peer stake to a circle-mate. Issuer enters an absolute
+/// CP amount; the opponent will accept or decline. The 30%-cap and balance
+/// checks happen server-side at accept time against live balances.
+Future<void> _showStakeDialog(
+  BuildContext context,
+  GameService service, {
+  required String opponentId,
+  required String opponentName,
+  required String circleId,
+}) async {
+  final controller = TextEditingController(text: '200');
+  await showDialog<void>(
+    context: context,
+    builder: (dialogContext) {
+      String? error;
+      bool busy = false;
+      return StatefulBuilder(
+        builder: (context, setState) {
+          return AlertDialog(
+            title: Text('Stake vs $opponentName'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(
+                  'Both players stake this amount of CP. Winner takes the pot '
+                  'minus a 5% rake. Minimum 50 CP.',
+                  style: TextStyle(fontSize: 13, color: Colors.black54),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: controller,
+                  keyboardType: TextInputType.number,
+                  decoration: InputDecoration(
+                    labelText: 'Stake (CP)',
+                    errorText: error,
+                    border: const OutlineInputBorder(),
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: busy ? null : () => Navigator.of(dialogContext).pop(),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: busy
+                    ? null
+                    : () async {
+                        final amount = int.tryParse(controller.text.trim());
+                        if (amount == null || amount < 50) {
+                          setState(() => error = 'Enter at least 50 CP');
+                          return;
+                        }
+                        setState(() {
+                          busy = true;
+                          error = null;
+                        });
+                        try {
+                          await service.proposeStake(
+                            opponentId: opponentId,
+                            circleId: circleId,
+                            amount: amount,
+                          );
+                          if (dialogContext.mounted) {
+                            Navigator.of(dialogContext).pop();
+                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                                content: Text(
+                                    'Stake offer sent to $opponentName')));
+                          }
+                        } on FirebaseFunctionsException catch (e) {
+                          setState(() {
+                            busy = false;
+                            error = e.message ?? 'Failed';
+                          });
+                        }
+                      },
+                child: busy
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Text('Send offer'),
+              ),
+            ],
+          );
+        },
+      );
+    },
+  );
+}
+
+/// Shows stake offers made TO the current user (they are the opponent), with
+/// Accept / Decline. Accepting locks both stakes, creates the game, and
+/// navigates into it.
+class _IncomingStakes extends StatelessWidget {
+  final GameService service;
+  const _IncomingStakes({required this.service});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: service.incomingStakesStream(),
+      builder: (context, snap) {
+        final docs = snap.data?.docs ?? [];
+        if (docs.isEmpty) return const SizedBox.shrink();
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+              child: Text('Stake offers (${docs.length})',
+                  style: const TextStyle(
+                      fontWeight: FontWeight.bold, color: Colors.indigo)),
+            ),
+            ...docs.map((d) {
+              final s = d.data();
+              final stakeId = d.id;
+              final amount = (s['amount'] ?? 0) as int;
+              return ListTile(
+                dense: true,
+                leading: const Icon(Icons.toll, color: Colors.indigo),
+                title: Text('Stake $amount CP'),
+                subtitle: const Text('Tap ✓ to accept and start the game'),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      tooltip: 'Accept',
+                      icon: const Icon(Icons.check, color: Colors.green),
+                      onPressed: () async {
+                        try {
+                          final gameId = await service.acceptStake(stakeId);
+                          if (context.mounted) {
+                            Navigator.of(context).push(MaterialPageRoute(
+                              builder: (_) =>
+                                  GameScreen(gameId: gameId, service: service),
+                            ));
+                          }
+                        } on FirebaseFunctionsException catch (e) {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(content: Text(e.message ?? 'Failed')));
+                          }
+                        }
+                      },
+                    ),
+                    IconButton(
+                      tooltip: 'Decline',
+                      icon: const Icon(Icons.close, color: Colors.red),
+                      onPressed: () async {
+                        try {
+                          await service.declineStake(stakeId);
                         } on FirebaseFunctionsException catch (e) {
                           if (context.mounted) {
                             ScaffoldMessenger.of(context).showSnackBar(

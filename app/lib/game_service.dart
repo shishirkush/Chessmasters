@@ -271,4 +271,77 @@ class GameService {
         .doc(id)
         .snapshots();
   }
+
+  // ---- Slice 3c: peer staking ----------------------------------------------
+
+  /// Propose a peer stake to a circle-mate. [amount] is absolute CP (both
+  /// sides stake this). No CP moves until the opponent accepts.
+  Future<String> proposeStake({
+    required String opponentId,
+    required String circleId,
+    required int amount,
+  }) async {
+    final res = await _fns.httpsCallable('proposeStake').call(<String, dynamic>{
+      'opponentId': opponentId,
+      'circleId': circleId,
+      'amount': amount,
+    });
+    return res.data['stakeId'] as String;
+  }
+
+  /// Accept a pending stake offer. Locks both stakes and creates the game;
+  /// returns the new gameId so the caller can navigate into it.
+  Future<String> acceptStake(String stakeId) async {
+    final res = await _fns
+        .httpsCallable('acceptStake')
+        .call(<String, dynamic>{'stakeId': stakeId});
+    return res.data['gameId'] as String;
+  }
+
+  /// Issuer cancels their own pending offer.
+  Future<void> cancelStake(String stakeId) async {
+    await _fns
+        .httpsCallable('cancelStake')
+        .call(<String, dynamic>{'stakeId': stakeId});
+  }
+
+  /// Opponent declines a pending offer.
+  Future<void> declineStake(String stakeId) async {
+    await _fns
+        .httpsCallable('declineStake')
+        .call(<String, dynamic>{'stakeId': stakeId});
+  }
+
+  /// Pending stake offers made TO me (I'm the opponent) — to accept/decline.
+  Stream<QuerySnapshot<Map<String, dynamic>>> incomingStakesStream() {
+    final id = uid;
+    return _db
+        .collection('stakes')
+        .where('opponentId', isEqualTo: id)
+        .where('status', isEqualTo: 'pending')
+        .snapshots();
+  }
+
+  /// Pending stake offers I made (I'm the issuer) — to cancel / await.
+  Stream<QuerySnapshot<Map<String, dynamic>>> outgoingStakesStream() {
+    final id = uid;
+    return _db
+        .collection('stakes')
+        .where('issuerId', isEqualTo: id)
+        .where('status', isEqualTo: 'pending')
+        .snapshots();
+  }
+
+  /// Live list of the current user's ACTIVE games (in progress). Used to show
+  /// a "Resume game" entry on the home screen — needed because a staked game
+  /// is created server-side when the opponent accepts, so the issuer has no
+  /// other way back into the board.
+  Stream<QuerySnapshot<Map<String, dynamic>>> activeGamesStream() {
+    final id = uid;
+    return _db
+        .collection('games')
+        .where('players', arrayContains: id)
+        .where('status', isEqualTo: 'active')
+        .snapshots();
+  }
 }

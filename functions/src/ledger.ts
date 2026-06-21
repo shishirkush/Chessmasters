@@ -49,12 +49,37 @@ const db = admin.firestore();
 export const SINK_ACCOUNT = "__sink__";
 
 // ---- Amounts (dials — starting values from the locked V1 design) ----------
+//
+// CP is an INTEGER-ONLY currency. There is no fractional CP anywhere in the
+// system. Every amount stored in the ledger is a whole number. Any computation
+// that could produce a fraction (e.g. a percentage stake or rake) is reduced
+// to an integer by a single fixed rule (see the helpers at the bottom of this
+// file), and the rounding residue is absorbed by the rake → sink, so totals
+// always reconcile exactly.
+//
+// Scale: we use a 10× base unit (vs the raw design numbers) so that typical
+// stakes are in the hundreds and the 5%-of-pot rake stays comfortably above 1
+// CP — keeping rounding distortion negligible while everything stays integer.
 
-/** Starting grant on first sign-in (§6: ~500 CP). */
-export const STARTING_GRANT = 500;
+/** Starting grant on first sign-in (§6: ~500 → 10× = 5,000 CP). */
+export const STARTING_GRANT = 5000;
 
-/** Daily allotment, granted once per UTC day on a real-human game (§6). */
-export const DAILY_ALLOTMENT = 50;
+/** Daily allotment, once per UTC day on a real-human game (§6: 50 → 500). */
+export const DAILY_ALLOTMENT = 500;
+
+/**
+ * Rake taken from a settled pot, as a fraction of the pot (§5: 5%). Applied as
+ * `round(pot * RAKE_RATE)` — see rakeOf(). The rake is the economy's SINK: it
+ * removes CP from circulation on every staked game, holding supply against
+ * inflation.
+ */
+export const RAKE_RATE = 0.05;
+
+/** Minimum stake a player may propose (anti-spam; keeps rake a real integer). */
+export const MIN_STAKE = 50;
+
+/** Hard cap: no single stake exceeds this fraction of a player's balance (§5). */
+export const MAX_STAKE_FRACTION = 0.30;
 
 // ---- Entry types ----------------------------------------------------------
 
@@ -160,6 +185,30 @@ export async function computeBalance(account: string): Promise<number> {
   return sum;
 }
 
+/**
+ * Balance summed INSIDE a transaction, for consistent reads when we're about
+ * to spend (staking). Firestore transactions can't aggregate, so we read the
+ * account's entries within the tx and sum them. Because escrow locks are
+ * negative entries, this sum is the SPENDABLE balance (escrowed CP already
+ * excluded). At V1 scale a user has few entries, so this is cheap.
+ *
+ * IMPORTANT: in a Firestore transaction, all reads must precede all writes.
+ * Call this before any tx.set/update in the same transaction.
+ */
+export async function computeBalanceInTx(
+  tx: Transaction,
+  account: string
+): Promise<number> {
+  const q = db.collection("ledger").where("account", "==", account);
+  const snap = await tx.get(q);
+  let sum = 0;
+  snap.forEach((doc) => {
+    const a = doc.get("amount");
+    if (typeof a === "number") sum += a;
+  });
+  return sum;
+}
+
 // ---- Faucet: starting grant -----------------------------------------------
 
 /**
@@ -207,4 +256,37 @@ export async function grantDailyAllotment(
     type: "daily_allotment",
     meta: { day: dayKey },
   });
+}
+
+// ---- Integer money math (THE single source of rounding truth) -------------
+//
+// CP is integer-only. These helpers are the ONLY place fractions get reduced
+// to integers, so the rounding rule is defined exactly once and can't drift.
+
+/**
+ * The integer stake for a given balance and fraction (e.g. 0.05 of 5000 = 250).
+ * Uses floor: a player never stakes more than the fraction implies, and the
+ * result is always a whole number ≤ balance.
+ */
+export function stakeOf(balance: number, fraction: number): number {
+  return Math.floor(balance * fraction);
+}
+
+/**
+ * The integer rake for a pot: round(pot * RAKE_RATE). Rounding residue (the
+ * fractional CP that "doesn't exist") is absorbed here and lands in the sink,
+ * so winner_credit + rake === pot exactly, with all three integers.
+ */
+export function rakeOf(pot: number): number {
+  return Math.round(pot * RAKE_RATE);
+}
+
+/**
+ * Split a settled pot into the winner's credit and the rake, as integers that
+ * sum EXACTLY to the pot. This is the conservation guarantee in one function:
+ * whatever the rounding, credit + rake === pot, no CP minted or lost.
+ */
+export function settlePot(pot: number): { winnerCredit: number; rake: number } {
+  const rake = rakeOf(pot);
+  return { winnerCredit: pot - rake, rake };
 }

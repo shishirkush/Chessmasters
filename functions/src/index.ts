@@ -400,3 +400,9 @@ export {
   approveJoin,
   rejectJoin,
 } from "./circles";
+export {
+  proposeStake,
+  acceptStake,
+  cancelStake,
+  declineStake,
+} from "./stakes";

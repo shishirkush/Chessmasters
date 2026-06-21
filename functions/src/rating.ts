@@ -23,6 +23,7 @@ import { FieldValue } from "firebase-admin/firestore";
 import { updatePlayer, RatingState } from "./glicko";
 import { START_RATING, START_RD, START_VOL } from "./users";
 import { grantDailyAllotment } from "./ledger";
+import { settleStakeForGame } from "./stakes";
 
 const db = admin.firestore();
 
@@ -160,6 +161,23 @@ export const onGameFinished = functions.firestore
         },
       });
     });
+
+    // ---- Stake settlement (3c-2) ------------------------------------------
+    // If this finished game is a peer staked game, settle its stake: pay the
+    // pot (minus rake) to the winner, or return stakes (minus rake) on a draw.
+    // The stake is linked via contextId. Idempotent inside settleStakeForGame
+    // (the stake's `settled` flag), independent of rating/allotment.
+    if (after.gameType === "peer" && typeof after.contextId === "string") {
+      try {
+        await settleStakeForGame(
+          context.params.gameId,
+          after.contextId,
+          result
+        );
+      } catch (e) {
+        console.error("stake settlement failed", e);
+      }
+    }
 
     // ---- Faucet #2: daily allotment (CP) ----------------------------------
     // Granted to EACH human player for playing a real game today. This is the
