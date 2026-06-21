@@ -24,6 +24,7 @@
 import * as functions from "firebase-functions/v1";
 import * as admin from "firebase-admin";
 import { FieldValue } from "firebase-admin/firestore";
+import { grantStartingCP } from "./ledger";
 
 const db = admin.firestore();
 
@@ -49,8 +50,11 @@ export const onUserCreate = functions.auth.user().onCreate(async (user) => {
   const ref = db.collection("users").doc(user.uid);
   const existing = await ref.get();
   if (existing.exists) {
-    // Never clobber an existing profile (would wipe rating). Just ensure the
-    // displayName/photo are reasonably fresh and stop.
+    // Never clobber an existing profile (would wipe rating). But DO ensure the
+    // starting grant exists — grantStartingCP is idempotent (deterministic
+    // ledger doc ID), so this safely back-fills users created before the CP
+    // economy existed without ever double-granting.
+    await grantStartingCP(user.uid);
     return;
   }
 
@@ -80,4 +84,8 @@ export const onUserCreate = functions.auth.user().onCreate(async (user) => {
     createdAt: FieldValue.serverTimestamp(),
     updatedAt: FieldValue.serverTimestamp(),
   });
+
+  // Faucet #1: the one-time starting grant (~500 CP), written as the user's
+  // first ledger entry. Idempotent, so a retry of this trigger won't double it.
+  await grantStartingCP(user.uid);
 });

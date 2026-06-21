@@ -196,6 +196,36 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 8),
             Text('Signed in as $name',
                 style: const TextStyle(fontSize: 14, color: Colors.black54)),
+            const SizedBox(height: 12),
+            // Live CP balance + rating. CP comes from the ledger sum; rating
+            // from the profile. Both update live.
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                StreamBuilder<int>(
+                  stream: _service.myCpBalanceStream(),
+                  builder: (context, snap) {
+                    final cp = snap.data;
+                    return _StatChip(
+                      icon: Icons.toll,
+                      label: cp == null ? 'CP …' : '$cp CP',
+                    );
+                  },
+                ),
+                const SizedBox(width: 10),
+                StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                  stream: _service.myProfileStream(),
+                  builder: (context, snap) {
+                    final data = snap.data?.data();
+                    final rating = (data?['rating'] as num?)?.round();
+                    return _StatChip(
+                      icon: Icons.military_tech,
+                      label: rating == null ? 'Rating …' : 'Rating $rating',
+                    );
+                  },
+                ),
+              ],
+            ),
             const SizedBox(height: 24),
             FilledButton.icon(
               onPressed: _busy ? null : _quickMatch,
@@ -230,6 +260,36 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// A small pill showing a stat (CP balance, rating) on the home screen.
+class _StatChip extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  const _StatChip({required this.icon, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.indigo.withOpacity(0.08),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 18, color: Colors.indigo),
+          const SizedBox(width: 6),
+          Text(label,
+              style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.indigo)),
+        ],
       ),
     );
   }

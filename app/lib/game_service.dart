@@ -138,6 +138,36 @@ class GameService {
     return _db.collection('users').doc(id).snapshots();
   }
 
+  /// Live CP balance for the current user.
+  ///
+  /// CP uses a PURE LEDGER-SUM model: there is no stored balance field. The
+  /// balance is the sum of all of this user's ledger entries (grants are
+  /// positive, stakes negative, pot wins positive, etc.). We stream the user's
+  /// own ledger entries (rules allow reading only your own) and sum them
+  /// client-side, so the balance updates live as the server appends entries.
+  ///
+  /// The ledger is the single source of truth; this stream just adds it up.
+  Stream<int> myCpBalanceStream() {
+    final id = uid;
+    if (id == null) return Stream<int>.value(0);
+    return _db
+        .collection('ledger')
+        .where('account', isEqualTo: id)
+        .snapshots()
+        .map((snap) {
+      var sum = 0;
+      for (final doc in snap.docs) {
+        final amount = doc.data()['amount'];
+        if (amount is int) {
+          sum += amount;
+        } else if (amount is num) {
+          sum += amount.toInt();
+        }
+      }
+      return sum;
+    });
+  }
+
   /// Live view of a single circle document.
   Stream<DocumentSnapshot<Map<String, dynamic>>> circleStream(String circleId) {
     return _db.collection('circles').doc(circleId).snapshots();

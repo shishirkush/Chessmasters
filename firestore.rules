@@ -63,5 +63,19 @@ service cloud.firestore {
         allow write: if false;
       }
     }
+
+    // SLICE 3a: the CP ledger (append-only, server-owned).
+    // A user may READ ONLY their own ledger entries (their financial record —
+    // used by the client to compute their live CP balance by summing). They
+    // can never read another user's entries. NO client writes, ever: all CP
+    // movement (grants, stakes, pots, rake) is written by Cloud Functions via
+    // the Admin SDK, which bypasses these rules. Entries are append-only and
+    // are never updated or deleted, by server convention — a correction is a
+    // new compensating entry, not an edit.
+    match /ledger/{entryId} {
+      allow read: if request.auth != null
+                  && resource.data.account == request.auth.uid;
+      allow write: if false;
+    }
   }
 }
