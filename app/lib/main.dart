@@ -151,6 +151,51 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _busy = false;
   String? _status;
 
+  // Auto-navigation into active games. A staked/challenge game is created
+  // server-side when the OPPONENT accepts, so the issuer (challenger) has no
+  // action that returns a gameId — without this they'd sit on whatever screen
+  // they were on while their game (and clock) is live. This listener watches
+  // the user's active games and pulls them into the board the moment one
+  // appears, no matter which screen is on top. Works uniformly for the
+  // accepter and the issuer, peer stakes and challenge-ups.
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _activeGamesSub;
+  final Set<String> _navigatedGameIds = {};
+  bool _inGame = false; // true while a GameScreen is on top (prevents stacking)
+
+  @override
+  void initState() {
+    super.initState();
+    _activeGamesSub =
+        _service.activeGamesStream().listen(_onActiveGames);
+  }
+
+  @override
+  void dispose() {
+    _activeGamesSub?.cancel();
+    super.dispose();
+  }
+
+  void _onActiveGames(QuerySnapshot<Map<String, dynamic>> snap) {
+    if (!mounted || _inGame) return;
+    // Find the first active game we haven't already routed into.
+    for (final doc in snap.docs) {
+      if (_navigatedGameIds.contains(doc.id)) continue;
+      _navigatedGameIds.add(doc.id);
+      _enterGame(doc.id);
+      break; // one at a time
+    }
+  }
+
+  Future<void> _enterGame(String gameId) async {
+    if (_inGame) return;
+    _inGame = true;
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => GameScreen(gameId: gameId, service: _service),
+    ));
+    // Returned from the board (game over or user backed out).
+    _inGame = false;
+  }
+
   Future<void> _quickMatch() async {
     setState(() {
       _busy = true;
@@ -161,9 +206,8 @@ class _HomeScreenState extends State<HomeScreen> {
       // straight to matchmaking — no ensureSignedIn() needed.
       final gameId = await _service.quickMatch();
       if (!mounted) return;
-      Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => GameScreen(gameId: gameId, service: _service),
-      ));
+      _navigatedGameIds.add(gameId); // avoid the listener double-pushing
+      _enterGame(gameId);
     } on FirebaseFunctionsException catch (e) {
       setState(() => _status = 'Error: ${e.message}');
     } catch (e) {
@@ -956,6 +1000,23 @@ class CircleDetailScreen extends StatelessWidget {
                                   ),
                                   child: const Text('Stake'),
                                 ),
+                                const SizedBox(width: 4),
+                                OutlinedButton(
+                                  style: OutlinedButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 10),
+                                    visualDensity: VisualDensity.compact,
+                                    foregroundColor: Colors.deepOrange,
+                                  ),
+                                  onPressed: () => _showChallengeDialog(
+                                    context,
+                                    service,
+                                    opponentId: memberUid,
+                                    opponentName:
+                                        p['displayName'] as String? ?? 'Player',
+                                  ),
+                                  child: const Text('Challenge'),
+                                ),
                               ],
                             ],
                           ),
@@ -1385,6 +1446,85 @@ Future<void> _showStakeDialog(
   );
 }
 
+/// Confirmation dialog to send a challenge-up. No amount entry — stakes are
+/// computed server-side from the rating gap (CP = entry fee for a rating shot).
+Future<void> _showChallengeDialog(
+  BuildContext context,
+  GameService service, {
+  required String opponentId,
+  required String opponentName,
+}) async {
+  await showDialog<void>(
+    context: context,
+    builder: (dialogContext) {
+      bool busy = false;
+      String? error;
+      return StatefulBuilder(
+        builder: (context, setState) {
+          return AlertDialog(
+            title: Text('Challenge $opponentName'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(
+                  'A challenge-up is a shot at a big rating climb. The stake is '
+                  'set by the rating gap — challenging a stronger player costs '
+                  'more CP, but an upset win means a large rating jump plus the '
+                  'pot. Both stakes are calculated when they accept.',
+                  style: TextStyle(fontSize: 13, color: Colors.black54),
+                ),
+                if (error != null) ...[
+                  const SizedBox(height: 10),
+                  Text(error!,
+                      style: const TextStyle(color: Colors.red, fontSize: 13)),
+                ],
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: busy ? null : () => Navigator.of(dialogContext).pop(),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                style: FilledButton.styleFrom(
+                    backgroundColor: Colors.deepOrange),
+                onPressed: busy
+                    ? null
+                    : () async {
+                        setState(() {
+                          busy = true;
+                          error = null;
+                        });
+                        try {
+                          await service.proposeChallengeUp(opponentId);
+                          if (dialogContext.mounted) {
+                            Navigator.of(dialogContext).pop();
+                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                                content:
+                                    Text('Challenge sent to $opponentName')));
+                          }
+                        } on FirebaseFunctionsException catch (e) {
+                          setState(() {
+                            busy = false;
+                            error = e.message ?? 'Failed';
+                          });
+                        }
+                      },
+                child: busy
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Text('Send challenge'),
+              ),
+            ],
+          );
+        },
+      );
+    },
+  );
+}
+
 /// Shows stake offers made TO the current user (they are the opponent), with
 /// Accept / Decline. Accepting locks both stakes, creates the game, and
 /// navigates into it.
@@ -1412,12 +1552,20 @@ class _IncomingStakes extends StatelessWidget {
             ...docs.map((d) {
               final s = d.data();
               final stakeId = d.id;
+              final isChallenge = s['kind'] == 'challenge_up';
               final amount = (s['amount'] ?? 0) as int;
               return ListTile(
                 dense: true,
-                leading: const Icon(Icons.toll, color: Colors.indigo),
-                title: Text('Stake $amount CP'),
-                subtitle: const Text('Tap ✓ to accept and start the game'),
+                leading: Icon(
+                  isChallenge ? Icons.bolt : Icons.toll,
+                  color: isChallenge ? Colors.deepOrange : Colors.indigo,
+                ),
+                title: Text(isChallenge
+                    ? 'Challenge-up'
+                    : 'Stake $amount CP'),
+                subtitle: Text(isChallenge
+                    ? 'Stakes set by rating gap — tap ✓ to accept'
+                    : 'Tap ✓ to accept and start the game'),
                 trailing: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -1426,12 +1574,18 @@ class _IncomingStakes extends StatelessWidget {
                       icon: const Icon(Icons.check, color: Colors.green),
                       onPressed: () async {
                         try {
-                          final gameId = await service.acceptStake(stakeId);
+                          // Accept only — entry into the board is handled
+                          // uniformly by the home screen's active-game
+                          // listener (for both the accepter and the issuer),
+                          // so we don't navigate here.
+                          if (isChallenge) {
+                            await service.acceptChallengeUp(stakeId);
+                          } else {
+                            await service.acceptStake(stakeId);
+                          }
                           if (context.mounted) {
-                            Navigator.of(context).push(MaterialPageRoute(
-                              builder: (_) =>
-                                  GameScreen(gameId: gameId, service: service),
-                            ));
+                            Navigator.of(context).popUntil(
+                                (route) => route.isFirst);
                           }
                         } on FirebaseFunctionsException catch (e) {
                           if (context.mounted) {

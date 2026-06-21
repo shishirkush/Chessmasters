@@ -26,7 +26,7 @@ import * as admin from "firebase-admin";
 import { FieldValue } from "firebase-admin/firestore";
 import { grantStartingCP } from "./ledger";
 
-const db = admin.firestore();
+import { db } from "./init";
 
 // ---- Glicko-2 starting values (V1 spec) -----------------------------------
 

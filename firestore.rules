@@ -92,5 +92,13 @@ service cloud.firestore {
                      );
       allow write: if false;
     }
+
+    // SLICE 3d: daily game counters (server-only).
+    // Written by Cloud Functions to enforce the quick-match and same-opponent
+    // daily caps. Clients never need to read these directly (the function
+    // returns a clear error when a cap is hit), so deny all client access.
+    match /gameCounts/{docId} {
+      allow read, write: if false;
+    }
   }
 }

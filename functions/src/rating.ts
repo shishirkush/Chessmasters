@@ -25,7 +25,7 @@ import { START_RATING, START_RD, START_VOL } from "./users";
 import { grantDailyAllotment } from "./ledger";
 import { settleStakeForGame } from "./stakes";
 
-const db = admin.firestore();
+import { db } from "./init";
 
 // Below this RD we consider a player's rating "established" (not provisional).
 // 110 is a common Glicko-2 threshold; tune later if needed.

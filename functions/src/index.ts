@@ -23,9 +23,15 @@ import * as admin from "firebase-admin";
 // "Cannot read properties of undefined (reading 'serverTimestamp')".
 import { FieldValue } from "firebase-admin/firestore";
 import { Chess } from "chess.js";
+import {
+  getCountsInTx,
+  bumpQuickMatch,
+  bumpOpponent,
+  QUICK_MATCH_DAILY_CAP,
+  SAME_OPPONENT_DAILY_CAP,
+} from "./counters";
 
-admin.initializeApp();
-const db = admin.firestore();
+import { db } from "./init";
 
 // ---- Constants (V1 spec) ---------------------------------------------------
 
@@ -164,6 +170,10 @@ export const joinGame = functions.https.onCall(async (data, context) => {
 
   return db.runTransaction(async (tx) => {
     let ref: FirebaseFirestore.DocumentReference;
+    let opponentId: string;
+
+    // Read this user's daily counts up front (reads-before-writes).
+    const myCounts = await getCountsInTx(tx, uid);
 
     if (requestedId) {
       ref = db.collection("games").doc(requestedId);
@@ -175,8 +185,32 @@ export const joinGame = functions.https.onCall(async (data, context) => {
         throw new functions.https.HttpsError("failed-precondition", "Game is not open to join.");
       if (g.whiteId === uid)
         throw new functions.https.HttpsError("failed-precondition", "You cannot join your own game.");
+      opponentId = g.whiteId as string;
+
+      // Casual game → quick-match cap applies to the joiner.
+      if (g.gameType === "casual" &&
+          myCounts.quickMatchCount >= QUICK_MATCH_DAILY_CAP) {
+        throw new functions.https.HttpsError(
+          "resource-exhausted",
+          `Daily quick-match limit reached (${QUICK_MATCH_DAILY_CAP}/day).`
+        );
+      }
+      // Anti-collusion cap: ≤3 games/day vs the same opponent.
+      if ((myCounts.opponentCounts[opponentId] || 0) >= SAME_OPPONENT_DAILY_CAP) {
+        throw new functions.https.HttpsError(
+          "resource-exhausted",
+          `Daily limit reached against this opponent (${SAME_OPPONENT_DAILY_CAP}/day).`
+        );
+      }
     } else {
-      // Quick match: find one waiting CASUAL game not created by this user.
+      // Quick match: enforce the casual cap up front.
+      if (myCounts.quickMatchCount >= QUICK_MATCH_DAILY_CAP) {
+        throw new functions.https.HttpsError(
+          "resource-exhausted",
+          `Daily quick-match limit reached (${QUICK_MATCH_DAILY_CAP}/day).`
+        );
+      }
+      // Find one waiting CASUAL game not created by this user.
       const q = await tx.get(
         db.collection("games")
           .where("status", "==", "waiting")
@@ -185,11 +219,23 @@ export const joinGame = functions.https.onCall(async (data, context) => {
       );
       const candidate = q.docs.find((d) => (d.data() as GameDoc).whiteId !== uid);
       if (!candidate) {
+        // No opponent waiting → create a waiting game. This consumes one of the
+        // creator's quick-match slots (they've entered a casual game today).
         const newRef = db.collection("games").doc();
         tx.set(newRef, freshGame(uid, "casual", null));
+        bumpQuickMatch(tx, uid);
         return { gameId: newRef.id, joined: false, waiting: true };
       }
       ref = candidate.ref;
+      opponentId = (candidate.data() as GameDoc).whiteId as string;
+
+      // Same-opponent cap against the waiting game's creator.
+      if ((myCounts.opponentCounts[opponentId] || 0) >= SAME_OPPONENT_DAILY_CAP) {
+        throw new functions.https.HttpsError(
+          "resource-exhausted",
+          `Daily limit reached against this opponent (${SAME_OPPONENT_DAILY_CAP}/day).`
+        );
+      }
     }
 
     // Activate: black joins, and the clock starts for white (turn 1).
@@ -200,6 +246,13 @@ export const joinGame = functions.https.onCall(async (data, context) => {
       lastMoveAt: now(), // white's clock starts now
       updatedAt: FieldValue.serverTimestamp(),
     });
+
+    // Count this casual game for the joiner (quick-match) and the same-opponent
+    // tally for BOTH players (each counts the other).
+    bumpQuickMatch(tx, uid);
+    bumpOpponent(tx, uid, opponentId);
+    bumpOpponent(tx, opponentId, uid);
+
     return { gameId: ref.id, joined: true, waiting: false };
   });
 });
@@ -405,4 +458,6 @@ export {
   acceptStake,
   cancelStake,
   declineStake,
+  proposeChallengeUp,
+  acceptChallengeUp,
 } from "./stakes";

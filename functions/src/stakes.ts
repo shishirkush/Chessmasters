@@ -42,8 +42,14 @@ import {
   MIN_STAKE,
   MAX_STAKE_FRACTION,
 } from "./ledger";
+import {
+  getCountsInTx,
+  bumpOpponent,
+  SAME_OPPONENT_DAILY_CAP,
+} from "./counters";
+import { challengeStakeAmount } from "./challenge";
 
-const db = admin.firestore();
+import { db } from "./init";
 
 // Game constants — must match the engine's fresh-game shape (index.ts).
 const STARTING_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -262,6 +268,17 @@ export const acceptStake = functions.https.onCall(async (data, context) => {
     const issuerBal = await computeBalanceInTx(tx, issuerId);
     const opponentBal = await computeBalanceInTx(tx, opponentId);
 
+    // Anti-collusion cap: ≤3 games/day vs the same opponent (any game type).
+    const issuerCounts = await getCountsInTx(tx, issuerId);
+    const opponentCounts = await getCountsInTx(tx, opponentId);
+    if ((issuerCounts.opponentCounts[opponentId] || 0) >= SAME_OPPONENT_DAILY_CAP ||
+        (opponentCounts.opponentCounts[issuerId] || 0) >= SAME_OPPONENT_DAILY_CAP) {
+      throw new functions.https.HttpsError(
+        "resource-exhausted",
+        `Daily limit reached against this opponent (${SAME_OPPONENT_DAILY_CAP}/day).`
+      );
+    }
+
     // Validate the §5 cap against BOTH players' current balances.
     if (issuerBal < amount) {
       throw new functions.https.HttpsError(
@@ -346,6 +363,10 @@ export const acceptStake = functions.https.onCall(async (data, context) => {
       updatedAt: FieldValue.serverTimestamp(),
     });
 
+    // Count this game toward the same-opponent cap for BOTH players.
+    bumpOpponent(tx, issuerId, opponentId);
+    bumpOpponent(tx, opponentId, issuerId);
+
     return { gameId: gameRef.id };
   });
 
@@ -405,17 +426,20 @@ export async function settleStakeForGame(
     const whiteId: string = s.whiteId;
     const blackId: string = s.blackId;
     const pot: number = s.pot;
-    const stake: number = s.issuerStake; // equal fixed CP, so == opponentStake
+    const issuerStake: number = s.issuerStake;
+    const opponentStake: number = s.opponentStake;
 
     if (result === "draw") {
-      // Return each stake minus their half of the rake. With equal stakes the
-      // pot is even and the rake splits cleanly; we still floor each player's
-      // refund and let any residual land in the sink so totals reconcile.
+      // Return each player's OWN stake minus the rake. For asymmetric stakes
+      // (challenge-up) the rake is split in proportion to each stake, floored
+      // per player; any rounding residual lands in the sink so the books
+      // reconcile exactly (refunds + sink == pot).
       const { rake } = settlePot(pot);
-      const halfRake = Math.floor(rake / 2);
-      const issuerRefund = stake - halfRake;
-      const opponentRefund = stake - halfRake;
-      // Residual (if rake is odd) goes to the sink so refunds + sink == pot.
+      const issuerRake = pot > 0 ? Math.floor((rake * issuerStake) / pot) : 0;
+      const opponentRake = pot > 0 ? Math.floor((rake * opponentStake) / pot) : 0;
+      const issuerRefund = issuerStake - issuerRake;
+      const opponentRefund = opponentStake - opponentRake;
+      // Residual (rounding) goes to the sink so refunds + sink == pot exactly.
       const sinkAmount = pot - issuerRefund - opponentRefund;
 
       appendEntry(tx, {
@@ -476,3 +500,255 @@ export async function settleStakeForGame(
     });
   });
 }
+
+// ---- Outside match (challenge-up, asymmetric) -----------------------------
+/**
+ * Propose a challenge-up against ANY player (typically higher-rated, outside
+ * your circle — the open ladder). Unlike peer staking (equal fixed CP), the
+ * stakes are ASYMMETRIC: each player stakes their own challenge-up fraction of
+ * their balance, computed from the rating gap.
+ *
+ * THE MODEL (per the firewall, §5):
+ *   CP is the ENTRY FEE for a shot at a rating climb — not the prize. The
+ *   underdog stakes a LARGE fraction (an improbable upset is an expensive
+ *   ticket) to buy a chance at a big rating jump (the real reward). The
+ *   favorite stakes a SMALL fraction and accepts for the CP (compensation for
+ *   risking their rating). Transfer-only, rake to sink — never mints CP.
+ *
+ * Stakes are computed at ACCEPT against live balances/ratings (like peer
+ * staking), so this just records the proposal.
+ */
+export const proposeChallengeUp = functions.https.onCall(
+  async (data, context) => {
+    const issuerId = requireAuth(context);
+    const opponentId: string | undefined = data?.opponentId;
+    if (!opponentId) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "opponentId is required."
+      );
+    }
+    if (opponentId === issuerId) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "You can't challenge yourself."
+      );
+    }
+
+    // Opponent must exist.
+    const oppSnap = await db.collection("users").doc(opponentId).get();
+    if (!oppSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Player not found.");
+    }
+
+    // One pending challenge per (issuer, opponent) pair.
+    const dupe = await db
+      .collection("stakes")
+      .where("issuerId", "==", issuerId)
+      .where("opponentId", "==", opponentId)
+      .where("kind", "==", "challenge_up")
+      .where("status", "==", "pending")
+      .limit(1)
+      .get();
+    if (!dupe.empty) {
+      throw new functions.https.HttpsError(
+        "already-exists",
+        "You already have a pending challenge to this player."
+      );
+    }
+
+    const ref = db.collection("stakes").doc();
+    await ref.set({
+      kind: "challenge_up", // distinguishes from peer stakes
+      issuerId,
+      opponentId,
+      circleId: null, // outside-circle / open ladder
+      status: "pending",
+      gameId: null,
+      pot: null,
+      settledResult: null,
+      settled: false,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+    return { stakeId: ref.id };
+  }
+);
+
+/**
+ * Accept a challenge-up. Computes BOTH players' asymmetric stakes from the
+ * live rating gap and balances, validates each against the 30% cap and the
+ * same-opponent daily cap, locks both (asymmetric escrow), creates the active
+ * "challenge_up" game, and links it. All atomic — same guarantees as peer
+ * accept, just with asymmetric amounts.
+ */
+export const acceptChallengeUp = functions.https.onCall(
+  async (data, context) => {
+    const uid = requireAuth(context);
+    const stakeId: string | undefined = data?.stakeId;
+    if (!stakeId) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "stakeId is required."
+      );
+    }
+
+    const stakeRef = db.collection("stakes").doc(stakeId);
+
+    return db.runTransaction(async (tx) => {
+      // ---- READS ----
+      const snap = await tx.get(stakeRef);
+      if (!snap.exists) {
+        throw new functions.https.HttpsError("not-found", "Challenge not found.");
+      }
+      const s = snap.data()!;
+      if (s.kind !== "challenge_up") {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Not a challenge-up stake."
+        );
+      }
+      if (s.status !== "pending") {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "This challenge is no longer open."
+        );
+      }
+      if (s.opponentId !== uid) {
+        throw new functions.https.HttpsError(
+          "permission-denied",
+          "Only the challenged player can accept."
+        );
+      }
+
+      const issuerId: string = s.issuerId;
+      const opponentId: string = s.opponentId;
+
+      // Live ratings (for the formula) and balances (for the cap).
+      const issuerProfileSnap = await tx.get(
+        db.collection("users").doc(issuerId)
+      );
+      const opponentProfileSnap = await tx.get(
+        db.collection("users").doc(opponentId)
+      );
+      const issuerRating =
+        (issuerProfileSnap.get("rating") as number) ?? 1500;
+      const opponentRating =
+        (opponentProfileSnap.get("rating") as number) ?? 1500;
+
+      const issuerBal = await computeBalanceInTx(tx, issuerId);
+      const opponentBal = await computeBalanceInTx(tx, opponentId);
+
+      // Same-opponent daily cap (both directions).
+      const issuerCounts = await getCountsInTx(tx, issuerId);
+      const opponentCounts = await getCountsInTx(tx, opponentId);
+      if (
+        (issuerCounts.opponentCounts[opponentId] || 0) >=
+          SAME_OPPONENT_DAILY_CAP ||
+        (opponentCounts.opponentCounts[issuerId] || 0) >=
+          SAME_OPPONENT_DAILY_CAP
+      ) {
+        throw new functions.https.HttpsError(
+          "resource-exhausted",
+          `Daily limit reached against this opponent (${SAME_OPPONENT_DAILY_CAP}/day).`
+        );
+      }
+
+      // Asymmetric stakes: each stakes their OWN challenge-up fraction, vs the
+      // other's rating, against their OWN balance. Underdog (lower rating)
+      // → larger fraction; favorite → smaller. (CP = the entry fee for the
+      // rating shot.)
+      const issuerStake = challengeStakeAmount(
+        issuerRating,
+        opponentRating,
+        issuerBal
+      );
+      const opponentStake = challengeStakeAmount(
+        opponentRating,
+        issuerRating,
+        opponentBal
+      );
+
+      if (issuerStake < MIN_STAKE || opponentStake < MIN_STAKE) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          `Both stakes must be at least ${MIN_STAKE} CP.`
+        );
+      }
+      if (issuerBal < issuerStake) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "The challenger no longer has enough CP."
+        );
+      }
+      if (opponentBal < opponentStake) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "You don't have enough CP for this challenge."
+        );
+      }
+
+      // ---- WRITES ----
+      const issuerIsWhite = Math.random() < 0.5;
+      const whiteId = issuerIsWhite ? issuerId : opponentId;
+      const blackId = issuerIsWhite ? opponentId : issuerId;
+
+      const gameRef = db.collection("games").doc();
+      tx.set(gameRef, {
+        status: "active",
+        gameType: "challenge_up",
+        contextId: stakeId,
+        fen: STARTING_FEN,
+        moves: [],
+        turn: "w",
+        whiteId,
+        blackId,
+        players: [whiteId, blackId],
+        whiteMs: INITIAL_MS,
+        blackMs: INITIAL_MS,
+        lastMoveAt: Date.now(),
+        result: null,
+        resultReason: null,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      // Asymmetric escrow locks.
+      appendEntry(tx, {
+        account: issuerId,
+        amount: -issuerStake,
+        type: "stake_lock",
+        gameId: gameRef.id,
+        meta: { stakeId, kind: "challenge_up" },
+      });
+      appendEntry(tx, {
+        account: opponentId,
+        amount: -opponentStake,
+        type: "stake_lock",
+        gameId: gameRef.id,
+        meta: { stakeId, kind: "challenge_up" },
+      });
+
+      tx.update(stakeRef, {
+        status: "locked",
+        issuerStake,
+        opponentStake,
+        pot: issuerStake + opponentStake,
+        gameId: gameRef.id,
+        whiteId,
+        blackId,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      // Same-opponent counters for both.
+      bumpOpponent(tx, issuerId, opponentId);
+      bumpOpponent(tx, opponentId, issuerId);
+
+      return {
+        gameId: gameRef.id,
+        issuerStake,
+        opponentStake,
+      };
+    });
+  }
+);

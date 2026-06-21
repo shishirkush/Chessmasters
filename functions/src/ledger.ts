@@ -35,7 +35,7 @@
 import * as admin from "firebase-admin";
 import { FieldValue, Transaction } from "firebase-admin/firestore";
 
-const db = admin.firestore();
+import { db } from "./init";
 
 // ---- Accounts -------------------------------------------------------------
 

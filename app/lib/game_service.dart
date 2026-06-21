@@ -344,4 +344,25 @@ class GameService {
         .where('status', isEqualTo: 'active')
         .snapshots();
   }
+
+  // ---- Slice 3d: challenge-up (outside / asymmetric staking) ----------------
+
+  /// Propose a challenge-up against another player. Stakes are asymmetric and
+  /// computed at accept from the rating gap. CP is the entry fee for a shot at
+  /// a rating climb (the underdog stakes more, for the bigger rating upside).
+  Future<String> proposeChallengeUp(String opponentId) async {
+    final res = await _fns
+        .httpsCallable('proposeChallengeUp')
+        .call(<String, dynamic>{'opponentId': opponentId});
+    return res.data['stakeId'] as String;
+  }
+
+  /// Accept a challenge-up offer. Locks both asymmetric stakes and creates the
+  /// game; returns the gameId.
+  Future<String> acceptChallengeUp(String stakeId) async {
+    final res = await _fns
+        .httpsCallable('acceptChallengeUp')
+        .call(<String, dynamic>{'stakeId': stakeId});
+    return res.data['gameId'] as String;
+  }
 }
