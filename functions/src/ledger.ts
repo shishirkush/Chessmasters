@@ -53,6 +53,9 @@ export const SINK_ACCOUNT = "__sink__";
 /** Starting grant on first sign-in (§6: ~500 CP). */
 export const STARTING_GRANT = 500;
 
+/** Daily allotment, granted once per UTC day on a real-human game (§6). */
+export const DAILY_ALLOTMENT = 50;
+
 // ---- Entry types ----------------------------------------------------------
 
 /**
@@ -170,5 +173,38 @@ export async function grantStartingCP(uid: string): Promise<void> {
     account: uid,
     amount: STARTING_GRANT,
     type: "starting_grant",
+  });
+}
+
+// ---- Faucet: daily allotment ----------------------------------------------
+
+/**
+ * The UTC calendar day as YYYY-MM-DD. We deliberately use UTC (not the
+ * player's local time) so "one allotment per day" has a single global
+ * definition with no timezone edge cases. Players never see this boundary;
+ * they just get their daily CP on the day's first real game.
+ */
+export function utcDayKey(date: Date = new Date()): string {
+  return date.toISOString().slice(0, 10); // "2026-06-21"
+}
+
+/**
+ * Grant a user their daily allotment for the given UTC day. Idempotent per
+ * (user, day): the ledger doc ID is `allot_<uid>_<YYYY-MM-DD>`, so no matter
+ * how many real games a user plays in a day, they receive at most one
+ * allotment. Returns true if it granted, false if already granted today.
+ *
+ * Engagement gate lives at the CALL SITE (only called from a real-human
+ * game-finished event), so this function just enforces once-per-day.
+ */
+export async function grantDailyAllotment(
+  uid: string,
+  dayKey: string = utcDayKey()
+): Promise<boolean> {
+  return appendUniqueEntry(`allot_${uid}_${dayKey}`, {
+    account: uid,
+    amount: DAILY_ALLOTMENT,
+    type: "daily_allotment",
+    meta: { day: dayKey },
   });
 }

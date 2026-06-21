@@ -22,6 +22,7 @@ import * as admin from "firebase-admin";
 import { FieldValue } from "firebase-admin/firestore";
 import { updatePlayer, RatingState } from "./glicko";
 import { START_RATING, START_RD, START_VOL } from "./users";
+import { grantDailyAllotment } from "./ledger";
 
 const db = admin.firestore();
 
@@ -159,4 +160,28 @@ export const onGameFinished = functions.firestore
         },
       });
     });
+
+    // ---- Faucet #2: daily allotment (CP) ----------------------------------
+    // Granted to EACH human player for playing a real game today. This is the
+    // engagement gate from §6: the main CP source ties to genuine human play,
+    // which blocks bot-farming. We do this OUTSIDE the rating transaction and
+    // keyed on (user, UTC-day) — independent idempotency from rating's
+    // per-game flag, so a rating retry never suppresses (or duplicates) the
+    // allotment, and vice versa.
+    //
+    // Bot/practice games are excluded: when the practice bot is added it will
+    // mark games isBotGame:true. Absent the flag (all current real games), we
+    // treat it as a real game and grant.
+    if (after.isBotGame === true) return;
+    try {
+      await Promise.all([
+        grantDailyAllotment(whiteId),
+        grantDailyAllotment(blackId),
+      ]);
+    } catch (e) {
+      // An allotment failure must not crash the trigger (rating already
+      // applied). Log and move on; the deterministic ID means a later game
+      // the same day will retry harmlessly.
+      console.error("daily allotment failed", e);
+    }
   });
