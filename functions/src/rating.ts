@@ -24,6 +24,7 @@ import { updatePlayer, RatingState } from "./glicko";
 import { START_RATING, START_RD, START_VOL } from "./users";
 import { grantDailyAllotment } from "./ledger";
 import { settleStakeForGame } from "./stakes";
+import { settleConquest } from "./conquest";
 
 import { db } from "./init";
 
@@ -181,12 +182,27 @@ export const onGameFinished = functions.firestore
         console.error("stake settlement failed", e);
       }
     }
-    // Slice 4 will add a sibling block here:
-    //   if ((after.gameType === "breach" || after.gameType === "gauntlet")
-    //       && typeof after.contextId === "string") {
-    //     await settleConquest(context.params.gameId, after.contextId, result);
-    //   }
-    // (breach/gauntlet route to a NEW one-sided settler, NOT settleStakeForGame)
+
+    // ---- Conquest settlement (Slice 4) ------------------------------------
+    // Conquest games (breach / gauntlet) settle through the ONE-SIDED conquest
+    // settler, NOT settleStakeForGame (which is symmetric two-staker). Linked
+    // via contextId = conquestId. Idempotent inside settleConquest (the conquest
+    // status guard + each stake's `settled` flag). Must sit ABOVE the daily-
+    // allotment block, which early-returns for bot games.
+    if (
+      (after.gameType === "breach" || after.gameType === "gauntlet") &&
+      typeof after.contextId === "string"
+    ) {
+      try {
+        await settleConquest(
+          context.params.gameId,
+          after.contextId,
+          result
+        );
+      } catch (e) {
+        console.error("conquest settlement failed", e);
+      }
+    }
 
     // ---- Faucet #2: daily allotment (CP) ----------------------------------
     // Granted to EACH human player for playing a real game today. This is the

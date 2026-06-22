@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -364,5 +366,105 @@ class GameService {
         .httpsCallable('acceptChallengeUp')
         .call(<String, dynamic>{'stakeId': stakeId});
     return res.data['gameId'] as String;
+  }
+
+  // ---- Slice 4: conquest (breach half) -------------------------------------
+
+  /// Mount a breach against a circle you don't belong to. Locks your breach
+  /// stake (challenge-up formula vs the circle owner's rating, 40% cap) and
+  /// creates a conquest in `breach_pending`. Returns the new conquestId.
+  ///
+  /// Throws FirebaseFunctionsException with 'failed-precondition' for: breaching
+  /// your own circle, a circle you're already in, having another active
+  /// conquest, the circle already under an active breach, the weekly cooldown
+  /// still active, or insufficient CP.
+  Future<String> initiateBreach(String circleId) async {
+    final res = await _fns
+        .httpsCallable('initiateBreach')
+        .call(<String, dynamic>{'circleId': circleId});
+    return res.data['conquestId'] as String;
+  }
+
+  /// Defend a breach as the FIRST circle member to accept (first-come). Creates
+  /// the breach game and returns its gameId so the caller can navigate into it.
+  /// The defender stakes nothing.
+  ///
+  /// Throws 'failed-precondition' if the breach is no longer open / already
+  /// being defended, or 'permission-denied' if you're not a circle member.
+  Future<String> acceptBreachDefense(String conquestId) async {
+    final res = await _fns
+        .httpsCallable('acceptBreachDefense')
+        .call(<String, dynamic>{'conquestId': conquestId});
+    return res.data['gameId'] as String;
+  }
+
+  /// Live view of a single conquest document (status machine, breach/Gauntlet
+  /// state). Used to drive the conquest screen as it advances.
+  Stream<DocumentSnapshot<Map<String, dynamic>>> conquestStream(
+      String conquestId) {
+    return _db.collection('conquests').doc(conquestId).snapshots();
+  }
+
+  /// Breaches I have mounted as the challenger (any status) — to track my own
+  /// active/finished conquests.
+  Stream<QuerySnapshot<Map<String, dynamic>>> myBreachesStream() {
+    final id = uid;
+    return _db
+        .collection('conquests')
+        .where('challengerId', isEqualTo: id)
+        .snapshots();
+  }
+
+  /// Breaches currently OPEN for defense on a given circle (status
+  /// 'breach_pending'). A circle member watches this to see an incoming breach
+  /// they can answer. Scoped to one circle so the rules' membership read passes.
+  Stream<QuerySnapshot<Map<String, dynamic>>> openBreachesForCircleStream(
+      String circleId) {
+    return _db
+        .collection('conquests')
+        .where('circleId', isEqualTo: circleId)
+        .where('status', isEqualTo: 'breach_pending')
+        .snapshots();
+  }
+
+  /// Authoritative, read-only check: can I breach this circle right now, and
+  /// what would it cost? Mirrors the server-side gates of initiateBreach but
+  /// mutates nothing. Returns the raw map from the function:
+  ///   eligible: bool
+  ///   reason: String?   (own_circle | already_member | active_conquest |
+  ///                       circle_under_breach | cooldown | insufficient_cp)
+  ///   cooldownDaysLeft: int?
+  ///   estimatedStake: int
+  ///   ownerRating, myRating, myBalance: int
+  ///
+  /// Best-effort: eligibility can pass here and initiateBreach still fail if
+  /// state changes in the gap — callers must catch that.
+  Future<Map<String, dynamic>> getBreachEligibility(String circleId) async {
+    final res = await _fns
+        .httpsCallable('getBreachEligibility')
+        .call(<String, dynamic>{'circleId': circleId});
+    return Map<String, dynamic>.from(res.data as Map);
+  }
+
+  /// Client-side preview of the breach stake (display only — the server is
+  /// authoritative at initiateBreach). A pure Dart port of challengeStakeAmount
+  /// (challenge.ts): the challenge-up fraction of [myBalance], scaled by the
+  /// rating gap vs the circle owner, clamped at the 40% cap, floored to an int.
+  ///
+  /// Lets the challenger screen show an instant "~X CP" estimate before the
+  /// getBreachEligibility round-trip returns the authoritative number.
+  static int estimateBreachStake({
+    required int myRating,
+    required int ownerRating,
+    required int myBalance,
+  }) {
+    const baseFraction = 0.05;
+    const spread = 0.35;
+    const maxFraction = 0.40; // raised 0.30 -> 0.40 (matches challenge.ts)
+    // Elo expected score for the challenger vs the owner.
+    final exp = 1 / (1 + math.pow(10, (ownerRating - myRating) / 400));
+    final frac = baseFraction + (1 - exp) * spread;
+    final capped = frac < maxFraction ? frac : maxFraction;
+    return (myBalance * capped).floor();
   }
 }

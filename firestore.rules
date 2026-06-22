@@ -93,6 +93,33 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // SLICE 4: conquest (server-owned).
+    // A signed-in user may READ a conquest if they are the challenger OR a
+    // current member of the target circle (so defenders and the owner can see
+    // the breach/Gauntlet they're involved in). Membership is checked with a
+    // cross-doc get() on the circle — the same pattern the joinRequests rule
+    // above already uses. NO client writes: initiateBreach / acceptBreachDefense
+    // / nomination / settlement all run in Cloud Functions via the Admin SDK,
+    // keeping the whole conquest state machine server-authoritative.
+    match /conquests/{conquestId} {
+      allow read: if request.auth != null
+                  && (
+                       request.auth.uid == resource.data.challengerId
+                       || request.auth.uid in get(
+                            /databases/$(database)/documents/circles/$(resource.data.circleId)
+                          ).data.members
+                     );
+      allow write: if false;
+    }
+
+    // SLICE 4: conquest cooldowns (server-only).
+    // Per-attacker-per-circle weekly breach cooldown timestamps, written and
+    // read ONLY by Cloud Functions (initiateBreach checks/sets them in-tx).
+    // Clients never need these, so deny all client access — same as gameCounts.
+    match /conquestCooldowns/{cdId} {
+      allow read, write: if false;
+    }
+
     // SLICE 3d: daily game counters (server-only).
     // Written by Cloud Functions to enforce the quick-match and same-opponent
     // daily caps. Clients never need to read these directly (the function

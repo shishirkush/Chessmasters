@@ -461,3 +461,8 @@ export {
   proposeChallengeUp,
   acceptChallengeUp,
 } from "./stakes";
+export {
+  initiateBreach,
+  acceptBreachDefense,
+  getBreachEligibility,
+} from "./conquest";

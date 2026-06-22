@@ -945,6 +945,9 @@ class CircleDetailScreen extends StatelessWidget {
                       ],
                     ),
                   ),
+                  // Slice 4: shows a Defend call-to-action when this circle is
+                  // under an active breach (renders nothing otherwise).
+                  _BreachDefendBanner(service: service, circleId: circleId),
                   const Divider(height: 1),
                   Expanded(
                     child: ListView.builder(
@@ -1104,6 +1107,344 @@ class CircleDetailScreen extends StatelessWidget {
     return result ?? false;
   }
 }
+
+// =============================================================================
+// SLICE 4: Conquest — breach UI (challenger screen + defend banner)
+// =============================================================================
+
+class ChallengerCircleScreen extends StatefulWidget {
+  final GameService service;
+  final String circleId;
+  final String circleName;
+  const ChallengerCircleScreen({
+    super.key,
+    required this.service,
+    required this.circleId,
+    required this.circleName,
+  });
+
+  @override
+  State<ChallengerCircleScreen> createState() => _ChallengerCircleScreenState();
+}
+
+class _ChallengerCircleScreenState extends State<ChallengerCircleScreen> {
+  Map<String, dynamic>? _elig; // server eligibility result (authoritative)
+  bool _loading = true;
+  String? _loadError;
+  bool _mounting = false; // breach call in flight
+
+  @override
+  void initState() {
+    super.initState();
+    _loadEligibility();
+  }
+
+  Future<void> _loadEligibility() async {
+    setState(() {
+      _loading = true;
+      _loadError = null;
+    });
+    try {
+      final e = await widget.service.getBreachEligibility(widget.circleId);
+      if (mounted) {
+        setState(() {
+          _elig = e;
+          _loading = false;
+        });
+      }
+    } on FirebaseFunctionsException catch (e) {
+      if (mounted) {
+        setState(() {
+          _loadError = e.message ?? 'Could not check eligibility.';
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _mountBreach() async {
+    setState(() => _mounting = true);
+    try {
+      final conquestId =
+          await widget.service.initiateBreach(widget.circleId);
+      if (!mounted) return;
+      // Breach mounted: pop back and confirm. (The challenger watches their
+      // conquest via myBreachesStream; a dedicated conquest screen lands with
+      // the Gauntlet commit.)
+      Navigator.of(context).pop();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Breach mounted on ${widget.circleName}. '
+            'Waiting for a defender…')),
+      );
+      // conquestId intentionally unused for now (no conquest screen yet).
+      // ignore: unused_local_variable
+      final _ = conquestId;
+    } on FirebaseFunctionsException catch (e) {
+      if (mounted) {
+        setState(() => _mounting = false);
+        // A lost race (e.g. circle_under_breach) lands here — re-check so the
+        // button reflects the new reality instead of staying enabled.
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.message ?? 'Breach failed.')),
+        );
+        _loadEligibility();
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Breach circle')),
+      body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+        stream: widget.service.circleStream(widget.circleId),
+        builder: (context, snap) {
+          final data = snap.data?.data();
+          if (snap.connectionState == ConnectionState.waiting &&
+              data == null) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (data == null) {
+            return const Center(child: Text('This circle no longer exists.'));
+          }
+          final name = data['name'] as String? ?? widget.circleName;
+          final members =
+              (data['members'] as List?)?.cast<String>() ?? <String>[];
+
+          // Authoritative numbers from getBreachEligibility once it returns.
+          final e = _elig;
+          final ownerRating = e?['ownerRating'] as int?;
+          final serverStake = e?['estimatedStake'] as int?;
+          final eligible = e?['eligible'] as bool? ?? false;
+          final reason = e?['reason'] as String?;
+          final cooldownDays = e?['cooldownDaysLeft'] as int?;
+
+          return ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              Text(name,
+                  style: const TextStyle(
+                      fontSize: 22, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              Text('${members.length} member'
+                  '${members.length == 1 ? '' : 's'}'
+                  '${ownerRating != null ? '  ·  owner rating $ownerRating' : ''}',
+                  style: const TextStyle(color: Colors.black54)),
+              const SizedBox(height: 20),
+
+              // ---- Stake preview ----
+              Card(
+                color: scheme.secondaryContainer,
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('Breach stake',
+                          style: TextStyle(fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 6),
+                      if (_loading)
+                        const Text('Estimating…',
+                            style: TextStyle(fontSize: 13))
+                      else
+                        Text(
+                          serverStake != null
+                              ? '$serverStake CP'
+                              : 'Unavailable',
+                          style: const TextStyle(
+                              fontSize: 24, fontWeight: FontWeight.bold),
+                        ),
+                      const SizedBox(height: 6),
+                      const Text(
+                        'You stake this to mount the breach. Win the defense '
+                        'game and it is refunded; lose or draw and it goes to '
+                        'the defender.',
+                        style: TextStyle(fontSize: 13, color: Colors.black54),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // ---- Prize / risk explainer ----
+              const Text('How a breach works',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 6),
+              const Text(
+                'Win one defense game to enter a best-of-3 Gauntlet for full '
+                'membership. A draw counts as a loss — you must win. Lose or '
+                'draw the defense and your stake goes to the defender.',
+                style: TextStyle(fontSize: 13, color: Colors.black54),
+              ),
+              const SizedBox(height: 24),
+
+              // ---- Breach button (eligibility-driven) ----
+              if (_loadError != null) ...[
+                Text(_loadError!,
+                    style: const TextStyle(color: Colors.red, fontSize: 13)),
+                const SizedBox(height: 8),
+                OutlinedButton(
+                  onPressed: _loadEligibility,
+                  child: const Text('Retry'),
+                ),
+              ] else
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                      backgroundColor: Colors.deepOrange),
+                  icon: _mounting
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2, color: Colors.white))
+                      : const Icon(Icons.flag),
+                  label: Text(_loading
+                      ? 'Checking…'
+                      : (eligible ? 'Breach this circle' : 'Cannot breach')),
+                  onPressed: (_loading || _mounting || !eligible)
+                      ? null
+                      : () async {
+                          final ok = await _confirmBreach(
+                              context, name, serverStake);
+                          if (ok) _mountBreach();
+                        },
+                ),
+              if (!_loading && !eligible && reason != null) ...[
+                const SizedBox(height: 10),
+                Text(
+                  _breachReasonText(reason, cooldownDays),
+                  style: const TextStyle(fontSize: 13, color: Colors.black54),
+                ),
+              ],
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<bool> _confirmBreach(
+      BuildContext context, String name, int? stake) async {
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Breach "$name"?'),
+        content: Text(
+          stake != null
+              ? 'This locks $stake CP. Win the defense game to get it back and '
+                'enter the Gauntlet; lose or draw and it goes to the defender.'
+              : 'This locks your breach stake. Win the defense game to get it '
+                'back; lose or draw and it goes to the defender.',
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: Colors.deepOrange),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Breach')),
+        ],
+      ),
+    );
+    return result ?? false;
+  }
+}
+
+/// Friendly text for a getBreachEligibility `reason` code.
+String _breachReasonText(String reason, int? cooldownDays) {
+  switch (reason) {
+    case 'own_circle':
+      return 'You own this circle — you can\'t breach it.';
+    case 'already_member':
+      return 'You\'re already a member of this circle.';
+    case 'active_conquest':
+      return 'You already have an active conquest. Finish it first.';
+    case 'circle_under_breach':
+      return 'This circle is already under an active breach. Try again later.';
+    case 'cooldown':
+      return cooldownDays != null
+          ? 'You breached this circle recently. Try again in $cooldownDays day'
+              '${cooldownDays == 1 ? '' : 's'}.'
+          : 'You breached this circle recently. Try again later.';
+    case 'insufficient_cp':
+      return 'You don\'t have enough CP to mount this breach.';
+    default:
+      return 'You can\'t breach this circle right now.';
+  }
+}
+
+/// Shown inside CircleDetailScreen (member view) when the circle is under an
+/// active breach: lets the FIRST member to tap Defend answer it. Navigates into
+/// the breach game on success.
+class _BreachDefendBanner extends StatelessWidget {
+  final GameService service;
+  final String circleId;
+  const _BreachDefendBanner({
+    required this.service,
+    required this.circleId,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: service.openBreachesForCircleStream(circleId),
+      builder: (context, snap) {
+        final docs = snap.data?.docs ?? [];
+        if (docs.isEmpty) return const SizedBox.shrink();
+        final conquest = docs.first;
+        final conquestId = conquest.id;
+
+        return Container(
+          width: double.infinity,
+          color: scheme.errorContainer,
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              Icon(Icons.shield, color: scheme.onErrorContainer),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  'Your circle is under breach. The first member to defend '
+                  'plays the challenger.',
+                  style: TextStyle(
+                      color: scheme.onErrorContainer, fontSize: 13),
+                ),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: () async {
+                  try {
+                    final gameId =
+                        await service.acceptBreachDefense(conquestId);
+                    if (context.mounted) {
+                      Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) =>
+                            GameScreen(service: service, gameId: gameId),
+                      ));
+                    }
+                  } on FirebaseFunctionsException catch (e) {
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text(e.message ?? 'Failed')),
+                      );
+                    }
+                  }
+                },
+                child: const Text('Defend'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+
 
 // =============================================================================
 // SLICE 2d: Search circles + join requests
@@ -1272,6 +1613,15 @@ class _SearchResultTile extends StatelessWidget {
               subtitle: Text('$memberCount member'
                   '${memberCount == 1 ? '' : 's'}'),
               trailing: trailing,
+              onTap: isMember
+                  ? null
+                  : () => Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => ChallengerCircleScreen(
+                          service: service,
+                          circleId: circleId,
+                          circleName: name,
+                        ),
+                      )),
             );
           },
         );
