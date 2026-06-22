@@ -14,17 +14,17 @@
  * Dials (starting values):
  *   baseFraction = 0.05
  *   spread       = 0.35
- *   MAX cap      = 0.30  (the §5 30%-of-balance hard cap)
+ *   MAX cap      = 0.40  (the §5 40%-of-balance hard cap)
  *
  * Note `expectedScore` is the Elo expectation. If the challenger is much
  * lower-rated, expectedScore → 0, so (1 - expectedScore) → 1 and the fraction
- * approaches base + spread = 0.40, which the 30% cap then clamps to 0.30. If
+ * approaches base + spread = 0.40, which the 40% cap then clamps to 0.40. If
  * evenly matched, expectedScore = 0.5, fraction = 0.05 + 0.175 = 0.225.
  */
 
 export const CHALLENGE_BASE_FRACTION = 0.05;
 export const CHALLENGE_SPREAD = 0.35;
-export const CHALLENGE_MAX_FRACTION = 0.3; // §5 hard cap
+export const CHALLENGE_MAX_FRACTION = 0.4; // §5 hard cap
 
 /** Elo expected score for the challenger vs the target. */
 export function expectedScore(

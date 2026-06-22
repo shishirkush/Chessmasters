@@ -79,7 +79,7 @@ export const RAKE_RATE = 0.05;
 export const MIN_STAKE = 50;
 
 /** Hard cap: no single stake exceeds this fraction of a player's balance (§5). */
-export const MAX_STAKE_FRACTION = 0.30;
+export const MAX_STAKE_FRACTION = 0.40;
 
 // ---- Entry types ----------------------------------------------------------
 
