@@ -6,7 +6,7 @@
  *   - The issuer proposes an ABSOLUTE CP amount; the opponent accepts or
  *     declines. (Equal fixed CP from both — symmetric pot.)
  *   - At ACCEPT (not propose) we validate against LIVE balances: each player
- *     must hold the stake AND the stake must be ≤ 30% of each player's balance
+ *     must hold the stake AND the stake must be ≤ 40% of each player's balance
  *     (the §5 hard cap, computed on current balance so it scales down as you
  *     lose).
  *   - Accepting LOCKS both stakes into escrow ATOMICALLY and creates an active
@@ -225,7 +225,7 @@ export const declineStake = functions.https.onCall(async (data, context) => {
 // ---- acceptStake (THE critical transaction) -------------------------------
 /**
  * Opponent accepts. In ONE transaction: validate both live balances against
- * the 30% cap, lock both stakes (negative ledger entries), create an ACTIVE
+ * the 40% cap, lock both stakes (negative ledger entries), create an ACTIVE
  * game wired to the engine, and flip the stake to "locked". All-or-nothing.
  */
 export const acceptStake = functions.https.onCall(async (data, context) => {
@@ -295,13 +295,13 @@ export const acceptStake = functions.https.onCall(async (data, context) => {
     if (amount > Math.floor(issuerBal * MAX_STAKE_FRACTION)) {
       throw new functions.https.HttpsError(
         "failed-precondition",
-        "Stake exceeds 30% of the issuer's balance."
+        "Stake exceeds 40% of the issuer's balance."
       );
     }
     if (amount > Math.floor(opponentBal * MAX_STAKE_FRACTION)) {
       throw new functions.https.HttpsError(
         "failed-precondition",
-        "Stake exceeds 30% of your balance."
+        "Stake exceeds 40% of your balance."
       );
     }
 
@@ -577,7 +577,7 @@ export const proposeChallengeUp = functions.https.onCall(
 
 /**
  * Accept a challenge-up. Computes BOTH players' asymmetric stakes from the
- * live rating gap and balances, validates each against the 30% cap and the
+ * live rating gap and balances, validates each against the 40% cap and the
  * same-opponent daily cap, locks both (asymmetric escrow), creates the active
  * "challenge_up" game, and links it. All atomic — same guarantees as peer
  * accept, just with asymmetric amounts.
