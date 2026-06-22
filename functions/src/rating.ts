@@ -167,7 +167,10 @@ export const onGameFinished = functions.firestore
     // pot (minus rake) to the winner, or return stakes (minus rake) on a draw.
     // The stake is linked via contextId. Idempotent inside settleStakeForGame
     // (the stake's `settled` flag), independent of rating/allotment.
-    if (after.gameType === "peer" && typeof after.contextId === "string") {
+    if (
+      (after.gameType === "peer" || after.gameType === "challenge_up") &&
+      typeof after.contextId === "string"
+    ) {
       try {
         await settleStakeForGame(
           context.params.gameId,
@@ -178,6 +181,12 @@ export const onGameFinished = functions.firestore
         console.error("stake settlement failed", e);
       }
     }
+    // Slice 4 will add a sibling block here:
+    //   if ((after.gameType === "breach" || after.gameType === "gauntlet")
+    //       && typeof after.contextId === "string") {
+    //     await settleConquest(context.params.gameId, after.contextId, result);
+    //   }
+    // (breach/gauntlet route to a NEW one-sided settler, NOT settleStakeForGame)
 
     // ---- Faucet #2: daily allotment (CP) ----------------------------------
     // Granted to EACH human player for playing a real game today. This is the
