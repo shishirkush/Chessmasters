@@ -6,7 +6,7 @@
  *   - The issuer proposes an ABSOLUTE CP amount; the opponent accepts or
  *     declines. (Equal fixed CP from both — symmetric pot.)
  *   - At ACCEPT (not propose) we validate against LIVE balances: each player
- *     must hold the stake AND the stake must be ≤ 40% of each player's balance
+ *     must hold the stake AND the stake must be ≤ 30% of each player's balance
  *     (the §5 hard cap, computed on current balance so it scales down as you
  *     lose).
  *   - Accepting LOCKS both stakes into escrow ATOMICALLY and creates an active
@@ -37,6 +37,7 @@ import { FieldValue } from "firebase-admin/firestore";
 import {
   appendEntry,
   computeBalanceInTx,
+  computeBalance,
   settlePot,
   SINK_ACCOUNT,
   MIN_STAKE,
@@ -50,6 +51,7 @@ import {
 import { challengeStakeAmount } from "./challenge";
 
 import { db } from "./init";
+import { notify, notifyTx, deleteOfferNotifications } from "./notify";
 
 // Game constants — must match the engine's fresh-game shape (index.ts).
 const STARTING_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -130,6 +132,20 @@ export const proposeStake = functions.https.onCall(async (data, context) => {
     );
   }
 
+  // Pre-validate the §5 cap against the ISSUER's current balance, so an
+  // over-cap offer is rejected at PROPOSE time with a clear message — rather
+  // than sailing through and failing only when the opponent tries to accept.
+  // (The authoritative cap check against BOTH balances still runs at accept,
+  // since the opponent's balance can change in between.)
+  const issuerBalance = await computeBalance(issuerId);
+  const issuerCap = Math.floor(issuerBalance * MAX_STAKE_FRACTION);
+  if (amount > issuerCap) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      `Stake exceeds 30% of your balance. Your current max is ${issuerCap} CP.`
+    );
+  }
+
   const ref = db.collection("stakes").doc();
   await ref.set({
     issuerId,
@@ -144,6 +160,16 @@ export const proposeStake = functions.https.onCall(async (data, context) => {
     createdAt: FieldValue.serverTimestamp(),
     updatedAt: FieldValue.serverTimestamp(),
   });
+
+  // Notify the opponent that they have a stake offer to accept/decline.
+  await notify({
+    recipientId: opponentId,
+    type: "stake_offer",
+    title: "New stake offer",
+    body: `You've been offered a ${amount} CP stake game.`,
+    data: { stakeId: ref.id, circleId, issuerId },
+  });
+
   return { stakeId: ref.id };
 });
 
@@ -182,6 +208,7 @@ export const cancelStake = functions.https.onCall(async (data, context) => {
       updatedAt: FieldValue.serverTimestamp(),
     });
   });
+  await deleteOfferNotifications(stakeId);
   return { ok: true };
 });
 
@@ -219,13 +246,15 @@ export const declineStake = functions.https.onCall(async (data, context) => {
       updatedAt: FieldValue.serverTimestamp(),
     });
   });
+  // The offer is resolved → remove its now-stale notification.
+  await deleteOfferNotifications(stakeId);
   return { ok: true };
 });
 
 // ---- acceptStake (THE critical transaction) -------------------------------
 /**
  * Opponent accepts. In ONE transaction: validate both live balances against
- * the 40% cap, lock both stakes (negative ledger entries), create an ACTIVE
+ * the 30% cap, lock both stakes (negative ledger entries), create an ACTIVE
  * game wired to the engine, and flip the stake to "locked". All-or-nothing.
  */
 export const acceptStake = functions.https.onCall(async (data, context) => {
@@ -295,13 +324,13 @@ export const acceptStake = functions.https.onCall(async (data, context) => {
     if (amount > Math.floor(issuerBal * MAX_STAKE_FRACTION)) {
       throw new functions.https.HttpsError(
         "failed-precondition",
-        "Stake exceeds 40% of the issuer's balance."
+        "Stake exceeds 30% of the issuer's balance."
       );
     }
     if (amount > Math.floor(opponentBal * MAX_STAKE_FRACTION)) {
       throw new functions.https.HttpsError(
         "failed-precondition",
-        "Stake exceeds 40% of your balance."
+        "Stake exceeds 30% of your balance."
       );
     }
 
@@ -311,13 +340,14 @@ export const acceptStake = functions.https.onCall(async (data, context) => {
     const whiteId = issuerIsWhite ? issuerId : opponentId;
     const blackId = issuerIsWhite ? opponentId : issuerId;
 
-    // Create the game ALREADY ACTIVE (both players known at accept; no waiting
-    // seat). Shape matches the engine's fresh active game so makeMove/resign/
-    // claimTimeout operate on it identically. gameType "peer", contextId =
+    // Create the game in the READY-GATE waiting state. Both players are known
+    // at accept, but the clock must NOT start until BOTH have arrived at the
+    // board (markReady). Shape matches the engine; gameType "peer", contextId =
     // stakeId so settlement (3c-2) can find the stake from the finished game.
+    // Stakes lock NOW (at accept); the clock waits for both players.
     const gameRef = db.collection("games").doc();
     tx.set(gameRef, {
-      status: "active",
+      status: "waiting",
       gameType: "peer",
       contextId: stakeId,
       fen: STARTING_FEN,
@@ -326,9 +356,10 @@ export const acceptStake = functions.https.onCall(async (data, context) => {
       whiteId,
       blackId,
       players: [whiteId, blackId],
+      ready: [], // ready-gate: both must markReady before the clock starts
       whiteMs: INITIAL_MS,
       blackMs: INITIAL_MS,
-      lastMoveAt: Date.now(), // white's clock starts now
+      lastMoveAt: null, // frozen until both players ready up
       result: null,
       resultReason: null,
       createdAt: FieldValue.serverTimestamp(),
@@ -367,8 +398,36 @@ export const acceptStake = functions.https.onCall(async (data, context) => {
     bumpOpponent(tx, issuerId, opponentId);
     bumpOpponent(tx, opponentId, issuerId);
 
+    // Tell the proposer their offer was accepted, and tell BOTH players the
+    // game is waiting for them to ready up (the global banner also surfaces
+    // this, but a notification persists in the bell/center).
+    notifyTx(tx, {
+      recipientId: issuerId,
+      type: "stake_accepted",
+      title: "Stake accepted",
+      body: "Your stake offer was accepted. Enter to start the game.",
+      data: { stakeId, gameId: gameRef.id },
+    });
+    notifyTx(tx, {
+      recipientId: issuerId,
+      type: "game_ready",
+      title: "Game ready to start",
+      body: "Enter the board to start your staked game.",
+      data: { gameId: gameRef.id },
+    });
+    notifyTx(tx, {
+      recipientId: opponentId,
+      type: "game_ready",
+      title: "Game ready to start",
+      body: "Enter the board to start your staked game.",
+      data: { gameId: gameRef.id },
+    });
+
     return { gameId: gameRef.id };
   });
+
+  // Offer resolved (accepted) → remove the now-stale stake_offer notification.
+  await deleteOfferNotifications(stakeId);
 
   return result;
 });
@@ -522,6 +581,9 @@ export const proposeChallengeUp = functions.https.onCall(
   async (data, context) => {
     const issuerId = requireAuth(context);
     const opponentId: string | undefined = data?.opponentId;
+    // Optional: the circle the challenge was issued from. Stored so the
+    // opponent's notification can deep-link to that circle's page to accept.
+    const circleId: string | null = (data?.circleId as string) ?? null;
     if (!opponentId) {
       throw new functions.https.HttpsError(
         "invalid-argument",
@@ -562,7 +624,7 @@ export const proposeChallengeUp = functions.https.onCall(
       kind: "challenge_up", // distinguishes from peer stakes
       issuerId,
       opponentId,
-      circleId: null, // outside-circle / open ladder
+      circleId, // the circle it was issued from (for the accept deep-link)
       status: "pending",
       gameId: null,
       pot: null,
@@ -571,13 +633,27 @@ export const proposeChallengeUp = functions.https.onCall(
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });
+
+    // Notify the opponent of the challenge so they can accept within the window.
+    await notify({
+      recipientId: opponentId,
+      type: "challenge_up",
+      title: "You've been challenged",
+      body: "Someone challenged you up. Accept to set the stakes and play.",
+      data: {
+        stakeId: ref.id,
+        issuerId,
+        ...(circleId ? { circleId } : {}),
+      },
+    });
+
     return { stakeId: ref.id };
   }
 );
 
 /**
  * Accept a challenge-up. Computes BOTH players' asymmetric stakes from the
- * live rating gap and balances, validates each against the 40% cap and the
+ * live rating gap and balances, validates each against the 30% cap and the
  * same-opponent daily cap, locks both (asymmetric escrow), creates the active
  * "challenge_up" game, and links it. All atomic — same guarantees as peer
  * accept, just with asymmetric amounts.
@@ -595,7 +671,7 @@ export const acceptChallengeUp = functions.https.onCall(
 
     const stakeRef = db.collection("stakes").doc(stakeId);
 
-    return db.runTransaction(async (tx) => {
+    const result = await db.runTransaction(async (tx) => {
       // ---- READS ----
       const snap = await tx.get(stakeRef);
       if (!snap.exists) {
@@ -695,7 +771,7 @@ export const acceptChallengeUp = functions.https.onCall(
 
       const gameRef = db.collection("games").doc();
       tx.set(gameRef, {
-        status: "active",
+        status: "waiting",
         gameType: "challenge_up",
         contextId: stakeId,
         fen: STARTING_FEN,
@@ -704,9 +780,10 @@ export const acceptChallengeUp = functions.https.onCall(
         whiteId,
         blackId,
         players: [whiteId, blackId],
+        ready: [], // ready-gate: both must markReady before the clock starts
         whiteMs: INITIAL_MS,
         blackMs: INITIAL_MS,
-        lastMoveAt: Date.now(),
+        lastMoveAt: null, // frozen until both players ready up
         result: null,
         resultReason: null,
         createdAt: FieldValue.serverTimestamp(),
@@ -744,11 +821,41 @@ export const acceptChallengeUp = functions.https.onCall(
       bumpOpponent(tx, issuerId, opponentId);
       bumpOpponent(tx, opponentId, issuerId);
 
+      // Notify the challenger their challenge was accepted, and both players
+      // that the game is waiting to start.
+      notifyTx(tx, {
+        recipientId: issuerId,
+        type: "stake_accepted",
+        title: "Challenge accepted",
+        body: "Your challenge was accepted. Enter to start the game.",
+        data: { stakeId, gameId: gameRef.id },
+      });
+      notifyTx(tx, {
+        recipientId: issuerId,
+        type: "game_ready",
+        title: "Game ready to start",
+        body: "Enter the board to start your challenge game.",
+        data: { gameId: gameRef.id },
+      });
+      notifyTx(tx, {
+        recipientId: opponentId,
+        type: "game_ready",
+        title: "Game ready to start",
+        body: "Enter the board to start your challenge game.",
+        data: { gameId: gameRef.id },
+      });
+
       return {
         gameId: gameRef.id,
         issuerStake,
         opponentStake,
       };
     });
+
+    // Challenge resolved (accepted) → remove the now-stale challenge_up
+    // notification for the opponent.
+    await deleteOfferNotifications(stakeId);
+
+    return result;
   }
 );

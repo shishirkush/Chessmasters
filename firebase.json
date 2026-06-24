@@ -7,10 +7,10 @@
     "rules": "firestore.rules"
   },
   "emulators": {
-    "auth": { "port": 9099 },
-    "functions": { "port": 5001 },
-    "firestore": { "port": 8080 },
-    "ui": { "enabled": true, "port": 4000 },
+    "auth": { "port": 9099, "host": "0.0.0.0" },
+    "functions": { "port": 5001, "host": "0.0.0.0" },
+    "firestore": { "port": 8080, "host": "0.0.0.0" },
+    "ui": { "enabled": true, "port": 4000, "host": "0.0.0.0" },
     "singleProjectMode": true
   }
 }

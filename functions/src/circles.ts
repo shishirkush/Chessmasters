@@ -33,6 +33,7 @@ import * as admin from "firebase-admin";
 import { FieldValue } from "firebase-admin/firestore";
 
 import { db } from "./init";
+import { notifyTx } from "./notify";
 
 const MAX_NAME_LEN = 40;
 const MIN_NAME_LEN = 2;
@@ -253,6 +254,16 @@ export const requestJoin = functions.https.onCall(async (data, context) => {
       status: "pending",
       createdAt: FieldValue.serverTimestamp(),
     });
+
+    // Notify the circle owner so they learn about the request without having
+    // to be on the circle page.
+    notifyTx(tx, {
+      recipientId: c.ownerId,
+      type: "join_request",
+      title: "New join request",
+      body: `${u.displayName ?? "A player"} wants to join ${c.name ?? "your circle"}.`,
+      data: { circleId, applicantUid: uid },
+    });
   });
 
   return { ok: true };
@@ -332,6 +343,14 @@ export const approveJoin = functions.https.onCall(async (data, context) => {
       updatedAt: FieldValue.serverTimestamp(),
     });
     tx.delete(reqRef);
+
+    notifyTx(tx, {
+      recipientId: applicantUid,
+      type: "join_approved",
+      title: "Request approved",
+      body: `You're now a member of ${c.name ?? "the circle"}.`,
+      data: { circleId },
+    });
   });
 
   return { ok: true };
@@ -360,13 +379,22 @@ export const rejectJoin = functions.https.onCall(async (data, context) => {
     if (!circleSnap.exists) {
       throw new functions.https.HttpsError("not-found", "Circle not found.");
     }
-    if (circleSnap.data()!.ownerId !== ownerUid) {
+    const cr = circleSnap.data()!;
+    if (cr.ownerId !== ownerUid) {
       throw new functions.https.HttpsError(
         "permission-denied",
         "Only the owner can reject join requests."
       );
     }
     tx.delete(reqRef);
+
+    notifyTx(tx, {
+      recipientId: applicantUid,
+      type: "join_rejected",
+      title: "Request declined",
+      body: `Your request to join ${cr.name ?? "the circle"} was declined.`,
+      data: { circleId },
+    });
   });
 
   return { ok: true };

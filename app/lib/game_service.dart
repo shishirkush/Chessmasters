@@ -43,11 +43,59 @@ class GameService {
     return result.user;
   }
 
+  /// TEST-ONLY sign-in (email/password) for development against the Firebase
+  /// Auth EMULATOR. The emulator accepts any email/password; if the account
+  /// doesn't exist yet it's created, otherwise it signs in. This avoids the
+  /// real-Google-token-to-emulator handoff that fails on physical devices.
+  /// Not used in production (production uses Google sign-in).
+  Future<User?> signInWithTestEmail(String email, String password) async {
+    try {
+      final result =
+          await _auth.signInWithEmailAndPassword(email: email, password: password);
+      return result.user;
+    } on FirebaseAuthException catch (e) {
+      // First time for this email → create it, then we're signed in.
+      if (e.code == 'user-not-found' || e.code == 'invalid-credential') {
+        final created = await _auth.createUserWithEmailAndPassword(
+            email: email, password: password);
+        return created.user;
+      }
+      rethrow;
+    }
+  }
+
   /// Sign out of both Firebase and Google (so the next sign-in re-prompts
   /// for account choice rather than silently reusing the last account).
   Future<void> signOut() async {
-    await _googleSignIn.signOut();
-    await _auth.signOut();
+    // Each step is guarded: a stale/invalid token can make one throw, and we
+    // still want the rest to run so local auth state is fully cleared.
+    try {
+      await _googleSignIn.signOut();
+    } catch (_) {}
+    try {
+      await _auth.signOut();
+    } catch (_) {}
+  }
+
+  /// True if an error is the stale-refresh-token / unauthenticated signature
+  /// that appears after the emulator is restarted (its auth users are wiped,
+  /// so the app's cached token is a ghost). When this happens the SDK spins in
+  /// a retry loop; callers should force a clean sign-out so the user can
+  /// re-authenticate instead of hanging.
+  bool isStaleAuthError(Object error) {
+    final s = error.toString();
+    return s.contains('INVALID_REFRESH_TOKEN') ||
+        s.contains('UNAUTHENTICATED') ||
+        s.contains('user-token-expired') ||
+        s.contains('user-disabled') ||
+        s.contains('user-not-found');
+  }
+
+  /// Force a clean sign-out in response to a stale-token error, so the auth
+  /// stream emits null and the app routes back to the sign-in screen (instead
+  /// of looping on an unusable token).
+  Future<void> recoverFromStaleAuth() async {
+    await signOut();
   }
 
   /// Quick match: join any open game, or create one and wait.
@@ -68,6 +116,20 @@ class GameService {
         .httpsCallable('joinGame')
         .call(<String, dynamic>{'gameId': gameId});
     return res.data['gameId'] as String;
+  }
+
+  /// Ready-gate: signal that this player has arrived at the board of a
+  /// PRE-SEATED staked/conquest game (peer / challenge_up / breach / gauntlet).
+  /// The game stays `waiting` (clock frozen) until BOTH assigned players have
+  /// called this; then it activates and the clock starts. Idempotent — safe to
+  /// call repeatedly. Returns {status, started}. The client calls this when the
+  /// GameScreen of a `waiting` staked game opens; readying is sticky, so the
+  /// player may then leave freely (a waiting game never blocks other play).
+  Future<Map<String, dynamic>> markReady(String gameId) async {
+    final res = await _fns
+        .httpsCallable('markReady')
+        .call(<String, dynamic>{'gameId': gameId});
+    return Map<String, dynamic>.from(res.data as Map);
   }
 
   /// Send a move intent. The server validates legality and turn order;
@@ -106,6 +168,12 @@ class GameService {
   /// Live view of the canonical game document.
   Stream<DocumentSnapshot<Map<String, dynamic>>> gameStream(String gameId) {
     return _db.collection('games').doc(gameId).snapshots();
+  }
+
+  /// One-time fetch of a game document (e.g. to check who its players are
+  /// before offering to enter it).
+  Future<DocumentSnapshot<Map<String, dynamic>>> gameOnce(String gameId) {
+    return _db.collection('games').doc(gameId).get();
   }
 
   // ---- Slice 2c: circles ---------------------------------------------------
@@ -347,15 +415,96 @@ class GameService {
         .snapshots();
   }
 
+  /// Ready-gate: games where I'm a player and the game is still `waiting` for
+  /// both players to arrive (markReady). The HomeScreen/global banner watches
+  /// this to offer an "Enter game" path INTO the waiting game (opening it
+  /// triggers markReady).
+  ///
+  /// NOTE: queries ONLY by `players arrayContains me` (a single-field index
+  /// that Firestore provides automatically) and filters `status == 'waiting'`
+  /// in Dart. Combining arrayContains with a second `where` would require a
+  /// COMPOSITE index, which fails silently in the emulator if absent — so we
+  /// filter client-side instead. Returns the raw docs; callers filter.
+  Stream<List<QueryDocumentSnapshot<Map<String, dynamic>>>>
+      waitingGamesStream() {
+    final id = uid;
+    return _db
+        .collection('games')
+        .where('players', arrayContains: id)
+        .snapshots()
+        .map((snap) => snap.docs
+            .where((d) => (d.data()['status'] as String?) == 'waiting')
+            .toList());
+  }
+
+  /// In-app notifications addressed to me, newest first. Drives the global bell
+  /// + notification center. Query is on recipientId only (single field — no
+  /// composite index); we sort client-side to avoid an index requirement.
+  Stream<List<QueryDocumentSnapshot<Map<String, dynamic>>>>
+      notificationsStream() {
+    final id = uid;
+    return _db
+        .collection('notifications')
+        .where('recipientId', isEqualTo: id)
+        .snapshots()
+        .map((snap) {
+      final docs = snap.docs.toList();
+      docs.sort((a, b) {
+        final ta = a.data()['createdAt'];
+        final tb = b.data()['createdAt'];
+        final va = ta is Timestamp ? ta.millisecondsSinceEpoch : 0;
+        final vb = tb is Timestamp ? tb.millisecondsSinceEpoch : 0;
+        return vb.compareTo(va); // newest first
+      });
+      return docs;
+    });
+  }
+
+  /// Mark a single notification read (clears it from the unread badge count).
+  Future<void> markNotificationRead(String notifId) async {
+    final id = uid;
+    if (id == null) return;
+    await _db
+        .collection('notifications')
+        .doc(notifId)
+        .update({'read': true});
+  }
+
+  /// Dismiss (delete) a notification — the × button on an informational item.
+  Future<void> dismissNotification(String notifId) async {
+    await _db.collection('notifications').doc(notifId).delete();
+  }
+
+  /// Mark all my unread notifications read (e.g. when the center is opened).
+  Future<void> markAllNotificationsRead() async {
+    final id = uid;
+    if (id == null) return;
+    // Single-field query (recipientId only — no composite index); filter unread
+    // in Dart.
+    final snap = await _db
+        .collection('notifications')
+        .where('recipientId', isEqualTo: id)
+        .get();
+    final batch = _db.batch();
+    for (final d in snap.docs) {
+      if (d.data()['read'] == true) continue;
+      batch.update(d.reference, {'read': true});
+    }
+    await batch.commit();
+  }
+
   // ---- Slice 3d: challenge-up (outside / asymmetric staking) ----------------
 
   /// Propose a challenge-up against another player. Stakes are asymmetric and
   /// computed at accept from the rating gap. CP is the entry fee for a shot at
   /// a rating climb (the underdog stakes more, for the bigger rating upside).
-  Future<String> proposeChallengeUp(String opponentId) async {
-    final res = await _fns
-        .httpsCallable('proposeChallengeUp')
-        .call(<String, dynamic>{'opponentId': opponentId});
+  Future<String> proposeChallengeUp(String opponentId,
+      {String? circleId}) async {
+    final res = await _fns.httpsCallable('proposeChallengeUp').call(
+        <String, dynamic>{
+          'opponentId': opponentId,
+          if (circleId != null) 'circleId': circleId,
+        });
     return res.data['stakeId'] as String;
   }
 
@@ -466,5 +615,47 @@ class GameService {
     final frac = baseFraction + (1 - exp) * spread;
     final capped = frac < maxFraction ? frac : maxFraction;
     return (myBalance * capped).floor();
+  }
+
+  // ---- Slice 4: Gauntlet (commit 2) ----------------------------------------
+
+  /// Owner nominates the Gauntlet defender for a conquest at `gauntlet_pending`.
+  /// Locks the defender's first per-game stake, creates Gauntlet game 1, and
+  /// flips the conquest to `gauntlet_active`. Returns the new gameId.
+  ///
+  /// Throws 'permission-denied' if not the owner, 'failed-precondition' if the
+  /// nominee isn't a member or the conquest isn't awaiting nomination.
+  Future<String> nominateGauntletDefender({
+    required String conquestId,
+    required String defenderId,
+  }) async {
+    final res = await _fns.httpsCallable('nominateGauntletDefender').call(
+      <String, dynamic>{'conquestId': conquestId, 'defenderId': defenderId},
+    );
+    return res.data['gameId'] as String;
+  }
+
+  /// Conquests on a given circle that are awaiting the owner's Gauntlet
+  /// nomination (status 'gauntlet_pending'). The owner watches this to know a
+  /// breach was survived and a champion must be nominated. Scoped to one circle
+  /// so the rules' membership read passes.
+  Stream<QuerySnapshot<Map<String, dynamic>>> gauntletPendingForCircleStream(
+      String circleId) {
+    return _db
+        .collection('conquests')
+        .where('circleId', isEqualTo: circleId)
+        .where('status', isEqualTo: 'gauntlet_pending')
+        .snapshots();
+  }
+
+  /// Live view of conquests on a circle that are in the Gauntlet (status
+  /// 'gauntlet_active') — to show series progress (X–Y, current game).
+  Stream<QuerySnapshot<Map<String, dynamic>>> activeGauntletForCircleStream(
+      String circleId) {
+    return _db
+        .collection('conquests')
+        .where('circleId', isEqualTo: circleId)
+        .where('status', isEqualTo: 'gauntlet_active')
+        .snapshots();
   }
 }

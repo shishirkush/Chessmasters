@@ -24,7 +24,6 @@ import { updatePlayer, RatingState } from "./glicko";
 import { START_RATING, START_RD, START_VOL } from "./users";
 import { grantDailyAllotment } from "./ledger";
 import { settleStakeForGame } from "./stakes";
-import { settleConquest } from "./conquest";
 
 import { db } from "./init";
 
@@ -168,10 +167,7 @@ export const onGameFinished = functions.firestore
     // pot (minus rake) to the winner, or return stakes (minus rake) on a draw.
     // The stake is linked via contextId. Idempotent inside settleStakeForGame
     // (the stake's `settled` flag), independent of rating/allotment.
-    if (
-      (after.gameType === "peer" || after.gameType === "challenge_up") &&
-      typeof after.contextId === "string"
-    ) {
+    if (after.gameType === "peer" && typeof after.contextId === "string") {
       try {
         await settleStakeForGame(
           context.params.gameId,
@@ -180,27 +176,6 @@ export const onGameFinished = functions.firestore
         );
       } catch (e) {
         console.error("stake settlement failed", e);
-      }
-    }
-
-    // ---- Conquest settlement (Slice 4) ------------------------------------
-    // Conquest games (breach / gauntlet) settle through the ONE-SIDED conquest
-    // settler, NOT settleStakeForGame (which is symmetric two-staker). Linked
-    // via contextId = conquestId. Idempotent inside settleConquest (the conquest
-    // status guard + each stake's `settled` flag). Must sit ABOVE the daily-
-    // allotment block, which early-returns for bot games.
-    if (
-      (after.gameType === "breach" || after.gameType === "gauntlet") &&
-      typeof after.contextId === "string"
-    ) {
-      try {
-        await settleConquest(
-          context.params.gameId,
-          after.contextId,
-          result
-        );
-      } catch (e) {
-        console.error("conquest settlement failed", e);
       }
     }
 
@@ -226,5 +201,44 @@ export const onGameFinished = functions.firestore
       // applied). Log and move on; the deterministic ID means a later game
       // the same day will retry harmlessly.
       console.error("daily allotment failed", e);
+    }
+
+    // ---- Clear stale game notifications -----------------------------------
+    // game_ready / game_activated / stake_accepted notifications are transient
+    // calls-to-action tied to THIS game. Once the game is finished they're
+    // meaningless (and tapping them would route to a dead board), so delete
+    // them for both players. Query each player's notifications (single-field,
+    // no index) and delete the ones whose data.gameId matches this game.
+    try {
+      const gid = context.params.gameId;
+      const players = [whiteId, blackId].filter((p): p is string => !!p);
+      for (const pid of players) {
+        const snap = await db
+          .collection("notifications")
+          .where("recipientId", "==", pid)
+          .get();
+        const batch = db.batch();
+        let count = 0;
+        for (const d of snap.docs) {
+          const n = d.data();
+          const t = n.type as string | undefined;
+          const dataGameId = (n.data as Record<string, unknown> | undefined)?.[
+            "gameId"
+          ];
+          if (
+            dataGameId === gid &&
+            (t === "game_ready" ||
+              t === "game_activated" ||
+              t === "stake_accepted")
+          ) {
+            batch.delete(d.ref);
+            count++;
+          }
+        }
+        if (count > 0) await batch.commit();
+      }
+    } catch (e) {
+      // Notification cleanup is best-effort; never crash the trigger over it.
+      console.error("notification cleanup failed", e);
     }
   });

@@ -40,10 +40,16 @@
 
 import * as functions from "firebase-functions/v1";
 import { FieldValue } from "firebase-admin/firestore";
-import { appendEntry, computeBalance, computeBalanceInTx } from "./ledger";
+import {
+  appendEntry,
+  computeBalance,
+  computeBalanceInTx,
+  SINK_ACCOUNT,
+} from "./ledger";
 import { challengeStakeAmount } from "./challenge";
 
 import { db } from "./init";
+import { notifyTx, notifyManyTx } from "./notify";
 
 // Game constants — must match the engine's fresh active game (index.ts).
 const STARTING_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -52,6 +58,15 @@ const INITIAL_MS = 5 * 60 * 1000; // 5+3 blitz
 // Per-attacker-per-circle breach cooldown: a given challenger may breach a
 // given circle at most once every 7 days. Passive check at initiate time.
 const BREACH_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Gauntlet: best-of-3 (first to 2 decisive wins). Draws replay, don't count.
+const GAUNTLET_WINS_TO_TAKE = 2;
+
+// The defender's per-game Gauntlet stake is a DISCOUNTED fraction of a normal
+// staked-game amount (25% — "25% of the equivalent 3-game stake", computed
+// per game per the Model A decision). Recomputed each game vs current balance
+// and the current rating gap.
+const GAUNTLET_STAKE_DISCOUNT = 0.25;
 
 export type ConquestStatus =
   | "breach_pending"
@@ -358,6 +373,21 @@ export const initiateBreach = functions.https.onCall(async (data, context) => {
       { merge: true }
     );
 
+    // Notify every circle member (esp. the owner) that their circle is under
+    // breach and can be defended — otherwise they'd never know unless on the
+    // circle page.
+    notifyManyTx(
+      tx,
+      members,
+      {
+        type: "breach_initiated",
+        title: "Your circle is under breach",
+        body: `A challenger is breaching ${c.name ?? "your circle"}. Defend to stop them.`,
+        data: { circleId, conquestId: conquestRef.id },
+      },
+      challengerId
+    );
+
     return { conquestId: conquestRef.id, breachStake };
   });
 
@@ -429,7 +459,7 @@ export const acceptBreachDefense = functions.https.onCall(
 
       const gameRef = db.collection("games").doc();
       tx.set(gameRef, {
-        status: "active",
+        status: "waiting",
         gameType: "breach",
         contextId: conquestId,
         fen: STARTING_FEN,
@@ -438,9 +468,10 @@ export const acceptBreachDefense = functions.https.onCall(
         whiteId,
         blackId,
         players: [whiteId, blackId],
+        ready: [], // ready-gate: both must markReady before the clock starts
         whiteMs: INITIAL_MS,
         blackMs: INITIAL_MS,
-        lastMoveAt: Date.now(),
+        lastMoveAt: null, // frozen until both players ready up
         result: null,
         resultReason: null,
         createdAt: FieldValue.serverTimestamp(),
@@ -462,7 +493,255 @@ export const acceptBreachDefense = functions.https.onCall(
         updatedAt: FieldValue.serverTimestamp(),
       });
 
+      // Both players: the breach game is waiting to start.
+      notifyTx(tx, {
+        recipientId: challengerId,
+        type: "game_ready",
+        title: "Breach game ready",
+        body: "Your breach is being defended. Enter to play.",
+        data: { gameId: gameRef.id, conquestId },
+      });
+      notifyTx(tx, {
+        recipientId: defenderId,
+        type: "game_ready",
+        title: "Breach game ready",
+        body: "Enter the board to defend against the breach.",
+        data: { gameId: gameRef.id, conquestId },
+      });
+
       return { gameId: gameRef.id };
+    });
+
+    return result;
+  }
+);
+
+// ---- Gauntlet helpers ------------------------------------------------------
+/**
+ * Compute + lock the defender's per-game Gauntlet stake and create the next
+ * Gauntlet game, all inside an existing transaction. Returns the new game and
+ * stake ids. Used by BOTH nominateGauntletDefender (game 1) and the auto-chain
+ * in settleConquest (games 2, 3, replays).
+ *
+ * Per-game stake (recomputed fresh each call): the defender's normal staked
+ * amount vs the challenger, discounted to 25%. Challenger stakes NOTHING.
+ * One-sided escrow: a single negative stake_lock on the defender.
+ *
+ * IMPORTANT: all reads happen before the writes (the caller's tx may have
+ * already written; Firestore requires reads-before-writes within a tx, so this
+ * helper must be called BEFORE any write that depends on its result, and the
+ * caller must not have done reads it needs after this point). We do the rating
+ * + balance reads here, then write.
+ */
+async function createGauntletGameInTx(
+  tx: FirebaseFirestore.Transaction,
+  conquestId: string,
+  circleId: string,
+  challengerId: string,
+  defenderId: string
+): Promise<{ gameId: string; stakeId: string; stake: number }> {
+  // Live ratings + defender balance for the discounted stake.
+  const challengerSnap = await tx.get(
+    db.collection("users").doc(challengerId)
+  );
+  const defenderSnap = await tx.get(db.collection("users").doc(defenderId));
+  const challengerRating = (challengerSnap.get("rating") as number) ?? 1500;
+  const defenderRating = (defenderSnap.get("rating") as number) ?? 1500;
+  const defenderBal = await computeBalanceInTx(tx, defenderId);
+
+  const normalStake = challengeStakeAmount(
+    defenderRating,
+    challengerRating,
+    defenderBal
+  );
+  const stake = Math.floor(normalStake * GAUNTLET_STAKE_DISCOUNT);
+  if (stake <= 0 || defenderBal < stake) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "The defender doesn't have enough CP to stake this Gauntlet game."
+    );
+  }
+
+  // Coin-flip colors per game.
+  const challengerIsWhite = Math.random() < 0.5;
+  const whiteId = challengerIsWhite ? challengerId : defenderId;
+  const blackId = challengerIsWhite ? defenderId : challengerId;
+
+  const gameRef = db.collection("games").doc();
+  const stakeRef = db.collection("stakes").doc();
+
+  tx.set(gameRef, {
+    status: "waiting",
+    gameType: "gauntlet",
+    contextId: conquestId,
+    fen: STARTING_FEN,
+    moves: [],
+    turn: "w",
+    whiteId,
+    blackId,
+    players: [whiteId, blackId],
+    ready: [], // ready-gate: both must markReady before the clock starts
+    whiteMs: INITIAL_MS,
+    blackMs: INITIAL_MS,
+    lastMoveAt: null, // frozen until both players ready up
+    result: null,
+    resultReason: null,
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+
+  // One-sided escrow: only the defender stakes. Reuse a stakes/{id} doc.
+  tx.set(stakeRef, {
+    kind: "gauntlet",
+    issuerId: defenderId, // the sole staker
+    opponentId: challengerId,
+    circleId,
+    conquestId,
+    amount: stake,
+    issuerStake: stake,
+    opponentStake: 0, // challenger stakes nothing in the Gauntlet
+    pot: stake,
+    status: "locked",
+    gameId: gameRef.id,
+    whiteId,
+    blackId,
+    settled: false,
+    settledResult: null,
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+
+  appendEntry(tx, {
+    account: defenderId,
+    amount: -stake,
+    type: "stake_lock",
+    gameId: gameRef.id,
+    meta: { stakeId: stakeRef.id, kind: "gauntlet", conquestId },
+  });
+
+  return { gameId: gameRef.id, stakeId: stakeRef.id, stake };
+}
+
+// ---- nominateGauntletDefender ---------------------------------------------
+/**
+ * Owner nominates the Gauntlet defender for a conquest sitting at
+ * `gauntlet_pending` (challenger won the breach). The owner may nominate
+ * themselves. The nominee must be a current circle member and not the
+ * challenger. Locks the defender's first per-game stake, creates Gauntlet game
+ * 1, and flips the conquest to `gauntlet_active`.
+ *
+ * V1 SCOPE: no online-detection / auto-cascade (deferred post-V1). The owner
+ * picks a specific member; if they never show, the existing 90s abandon rule
+ * resolves the game as a defender loss. (The "nominated defender never shows →
+ * challenger accepted" fallback is a post-V1 refinement that needs presence.)
+ */
+export const nominateGauntletDefender = functions.https.onCall(
+  async (data, context) => {
+    const callerId = requireAuth(context);
+    const conquestId: string | undefined = data?.conquestId;
+    const defenderId: string | undefined = data?.defenderId;
+    if (!conquestId || !defenderId) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "conquestId and defenderId are required."
+      );
+    }
+
+    const conquestRef = db.collection("conquests").doc(conquestId);
+
+    const result = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(conquestRef);
+      if (!snap.exists) {
+        throw new functions.https.HttpsError("not-found", "Conquest not found.");
+      }
+      const q = snap.data()!;
+
+      if (q.status !== "gauntlet_pending") {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "This conquest is not awaiting a Gauntlet nomination."
+        );
+      }
+
+      const challengerId: string = q.challengerId;
+      const circleId: string = q.circleId;
+      const ownerId: string = q.ownerId;
+
+      // Only the owner nominates.
+      if (callerId !== ownerId) {
+        throw new functions.https.HttpsError(
+          "permission-denied",
+          "Only the circle owner can nominate the Gauntlet defender."
+        );
+      }
+      // The challenger can't be the defender.
+      if (defenderId === challengerId) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "The challenger can't be nominated as the defender."
+        );
+      }
+
+      // Nominee must be a current member.
+      const circleSnap = await tx.get(db.collection("circles").doc(circleId));
+      if (!circleSnap.exists) {
+        throw new functions.https.HttpsError("not-found", "Circle not found.");
+      }
+      const members: string[] = Array.isArray(circleSnap.get("members"))
+        ? (circleSnap.get("members") as string[])
+        : [];
+      if (!members.includes(defenderId)) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "The nominated defender must be a member of the circle."
+        );
+      }
+
+      // Create Gauntlet game 1 + lock the first defender stake.
+      const first = await createGauntletGameInTx(
+        tx,
+        conquestId,
+        circleId,
+        challengerId,
+        defenderId
+      );
+
+      tx.update(conquestRef, {
+        status: "gauntlet_active" as ConquestStatus,
+        "gauntlet.defenderId": defenderId,
+        "gauntlet.currentGameId": first.gameId,
+        "gauntlet.currentStakeId": first.stakeId,
+        "gauntlet.challengerWins": 0,
+        "gauntlet.defenderWins": 0,
+        "gauntlet.gameIds": [],
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      // Notify the nominated defender they're in the gauntlet, and both players
+      // that the first gauntlet game is waiting to start.
+      notifyTx(tx, {
+        recipientId: defenderId,
+        type: "gauntlet_nominated",
+        title: "You're defending the gauntlet",
+        body: "You've been nominated to defend. Enter to start the first game.",
+        data: { conquestId, gameId: first.gameId },
+      });
+      notifyTx(tx, {
+        recipientId: defenderId,
+        type: "game_ready",
+        title: "Gauntlet game ready",
+        body: "Enter the board to start your gauntlet game.",
+        data: { gameId: first.gameId },
+      });
+      notifyTx(tx, {
+        recipientId: challengerId,
+        type: "game_ready",
+        title: "Gauntlet game ready",
+        body: "Enter the board to start your gauntlet game.",
+        data: { gameId: first.gameId },
+      });
+
+      return { gameId: first.gameId, defenderStake: first.stake };
     });
 
     return result;
@@ -563,9 +842,247 @@ export async function settleConquest(
       return;
     }
 
-    // ---- GAUNTLET branch (next commit) ----
+    // ---- GAUNTLET branch ----
+    if (q.gauntlet?.currentGameId === gameId) {
+      if (q.status !== "gauntlet_active") return; // idempotent no-op
+
+      const g = q.gauntlet;
+      const priorGameIds: string[] = Array.isArray(g.gameIds) ? g.gameIds : [];
+      // Idempotency: already-processed game → no-op (no double settle/chain).
+      if (priorGameIds.includes(gameId)) return;
+
+      const challengerId: string = q.challengerId;
+      const defenderId: string = g.defenderId;
+
+      // ===== ALL READS FIRST (Firestore: reads before writes) =====
+      const gameSnap = await tx.get(db.collection("games").doc(gameId));
+      const whiteId: string = gameSnap.get("whiteId");
+      const challengerIsWhite = whiteId === challengerId;
+      const challengerWon =
+        (result === "white" && challengerIsWhite) ||
+        (result === "black" && !challengerIsWhite);
+      const defenderWon =
+        (result === "white" && !challengerIsWhite) ||
+        (result === "black" && challengerIsWhite);
+      const isDraw = result === "draw";
+
+      const stakeRef = db.collection("stakes").doc(g.currentStakeId);
+      const stakeSnap = await tx.get(stakeRef);
+      if (!stakeSnap.exists) {
+        console.error("settleConquest: gauntlet stake missing", g.currentStakeId);
+        return;
+      }
+      const s = stakeSnap.data()!;
+      const alreadySettled = s.settled === true;
+      const gameStake: number = s.issuerStake; // defender is the sole staker
+
+      // Compute the post-game win counts to decide the outcome BEFORE writing.
+      const challengerWins: number =
+        (g.challengerWins ?? 0) + (challengerWon ? 1 : 0);
+      const defenderWins: number =
+        (g.defenderWins ?? 0) + (defenderWon ? 1 : 0);
+      const newGameIds = [...priorGameIds, gameId];
+
+      const challengerTookSeries = challengerWins >= GAUNTLET_WINS_TO_TAKE;
+      const defenderTookSeries = defenderWins >= GAUNTLET_WINS_TO_TAKE;
+      const willChain = !challengerTookSeries && !defenderTookSeries;
+
+      // Conditional reads, still BEFORE any write:
+      //  - terminal challenger win → read the circle (to add membership)
+      //  - chaining → read ratings + defender balance for the next stake
+      let circleSnap: FirebaseFirestore.DocumentSnapshot | null = null;
+      if (challengerTookSeries) {
+        circleSnap = await tx.get(db.collection("circles").doc(q.circleId));
+      }
+
+      let nextStake = 0;
+      let nextWhiteId = "";
+      let nextBlackId = "";
+      let defenderCantAfford = false;
+      if (willChain) {
+        const challengerSnap = await tx.get(
+          db.collection("users").doc(challengerId)
+        );
+        const defenderSnap = await tx.get(
+          db.collection("users").doc(defenderId)
+        );
+        const challengerRating =
+          (challengerSnap.get("rating") as number) ?? 1500;
+        const defenderRating = (defenderSnap.get("rating") as number) ?? 1500;
+        const defenderBal = await computeBalanceInTx(tx, defenderId);
+        const normalStake = challengeStakeAmount(
+          defenderRating,
+          challengerRating,
+          defenderBal
+        );
+        nextStake = Math.floor(normalStake * GAUNTLET_STAKE_DISCOUNT);
+
+        if (nextStake <= 0 || defenderBal < nextStake) {
+          // The defender can't stake the next game — they can't mount a
+          // defense, so the challenger takes the series by default. (Rare:
+          // the per-game stake scales down with balance, so this only hits a
+          // nearly-broke defender. Pre-write, so read the circle now for the
+          // membership add.)
+          defenderCantAfford = true;
+          circleSnap = await tx.get(db.collection("circles").doc(q.circleId));
+        } else {
+          const challengerIsWhiteNext = Math.random() < 0.5;
+          nextWhiteId = challengerIsWhiteNext ? challengerId : defenderId;
+          nextBlackId = challengerIsWhiteNext ? defenderId : challengerId;
+        }
+      }
+
+      // ===== WRITES =====
+      // 1) Settle THIS game's defender stake (one-sided, no rake).
+      if (!alreadySettled) {
+        if (challengerWon) {
+          appendEntry(tx, {
+            account: SINK_ACCOUNT,
+            amount: gameStake,
+            type: "rake",
+            gameId,
+            meta: {
+              stakeId: g.currentStakeId,
+              conquestId,
+              kind: "gauntlet",
+              outcome: "gauntlet_burn",
+            },
+          });
+          tx.update(stakeRef, {
+            status: "settled",
+            settled: true,
+            settledResult: "burned",
+            updatedAt: FieldValue.serverTimestamp(),
+          });
+        } else {
+          appendEntry(tx, {
+            account: defenderId,
+            amount: gameStake,
+            type: "stake_return",
+            gameId,
+            meta: {
+              stakeId: g.currentStakeId,
+              conquestId,
+              kind: "gauntlet",
+              outcome: isDraw
+                ? "gauntlet_draw_return"
+                : "gauntlet_defender_hold",
+            },
+          });
+          tx.update(stakeRef, {
+            status: "settled",
+            settled: true,
+            settledResult: "defender",
+            updatedAt: FieldValue.serverTimestamp(),
+          });
+        }
+      }
+
+      // 2) Terminal: challenger took the series (or defender can't afford to
+      //    continue → can't defend → challenger takes it).
+      if (challengerTookSeries || defenderCantAfford) {
+        if (circleSnap && circleSnap.exists) {
+          const members: string[] = Array.isArray(circleSnap.get("members"))
+            ? (circleSnap.get("members") as string[])
+            : [];
+          if (!members.includes(challengerId)) {
+            tx.update(db.collection("circles").doc(q.circleId), {
+              members: FieldValue.arrayUnion(challengerId),
+              memberCount:
+                (circleSnap.get("memberCount") ?? members.length) + 1,
+              updatedAt: FieldValue.serverTimestamp(),
+            });
+          }
+        }
+        tx.update(conquestRef, {
+          "gauntlet.challengerWins": challengerWins,
+          "gauntlet.defenderWins": defenderWins,
+          "gauntlet.gameIds": newGameIds,
+          "gauntlet.currentGameId": null,
+          "gauntlet.currentStakeId": null,
+          status: "challenger_won" as ConquestStatus,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        return;
+      }
+
+      // 3) Terminal: challenger ejected.
+      if (defenderTookSeries) {
+        tx.update(conquestRef, {
+          "gauntlet.challengerWins": challengerWins,
+          "gauntlet.defenderWins": defenderWins,
+          "gauntlet.gameIds": newGameIds,
+          "gauntlet.currentGameId": null,
+          "gauntlet.currentStakeId": null,
+          status: "challenger_ejected" as ConquestStatus,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        return;
+      }
+
+      // 4) Not terminal → AUTO-CHAIN the next game (reads already done above).
+      const nextGameRef = db.collection("games").doc();
+      const nextStakeRef = db.collection("stakes").doc();
+
+      tx.set(nextGameRef, {
+        status: "waiting",
+        gameType: "gauntlet",
+        contextId: conquestId,
+        fen: STARTING_FEN,
+        moves: [],
+        turn: "w",
+        whiteId: nextWhiteId,
+        blackId: nextBlackId,
+        players: [nextWhiteId, nextBlackId],
+        ready: [], // ready-gate: both must markReady before the clock starts
+        whiteMs: INITIAL_MS,
+        blackMs: INITIAL_MS,
+        lastMoveAt: null, // frozen until both players ready up
+        result: null,
+        resultReason: null,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      tx.set(nextStakeRef, {
+        kind: "gauntlet",
+        issuerId: defenderId,
+        opponentId: challengerId,
+        circleId: q.circleId,
+        conquestId,
+        amount: nextStake,
+        issuerStake: nextStake,
+        opponentStake: 0,
+        pot: nextStake,
+        status: "locked",
+        gameId: nextGameRef.id,
+        whiteId: nextWhiteId,
+        blackId: nextBlackId,
+        settled: false,
+        settledResult: null,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      appendEntry(tx, {
+        account: defenderId,
+        amount: -nextStake,
+        type: "stake_lock",
+        gameId: nextGameRef.id,
+        meta: { stakeId: nextStakeRef.id, kind: "gauntlet", conquestId },
+      });
+
+      tx.update(conquestRef, {
+        "gauntlet.challengerWins": challengerWins,
+        "gauntlet.defenderWins": defenderWins,
+        "gauntlet.gameIds": newGameIds,
+        "gauntlet.currentGameId": nextGameRef.id,
+        "gauntlet.currentStakeId": nextStakeRef.id,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      return;
+    }
+
     console.error(
-      "settleConquest: gameId did not match breach game (gauntlet branch pending)",
+      "settleConquest: gameId matched neither breach nor current gauntlet game",
       conquestId,
       gameId
     );

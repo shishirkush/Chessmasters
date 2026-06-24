@@ -32,6 +32,7 @@ import {
 } from "./counters";
 
 import { db } from "./init";
+import { notifyTx } from "./notify";
 
 // ---- Constants (V1 spec) ---------------------------------------------------
 
@@ -75,6 +76,13 @@ interface GameDoc {
   whiteId: string | null;
   blackId: string | null;
   players: string[];
+  // Ready-gate (pre-seated staked/conquest games only). Both seats are assigned
+  // at creation, but the clock must not start until BOTH assigned players have
+  // arrived at the board. `ready` holds the uids who have signalled presence via
+  // markReady. When both whiteId and blackId are in `ready`, the game activates
+  // and the clock starts. Casual quick-match games do NOT use this (they signal
+  // presence via the empty blackId seat instead) and leave it as an empty array.
+  ready?: string[];
   // ---- Clock (server-authoritative; all times in ms) ----
   whiteMs: number;            // white's remaining time
   blackMs: number;            // black's remaining time
@@ -254,6 +262,89 @@ export const joinGame = functions.https.onCall(async (data, context) => {
     bumpOpponent(tx, opponentId, uid);
 
     return { gameId: ref.id, joined: true, waiting: false };
+  });
+});
+
+export const markReady = functions.https.onCall(async (data, context) => {
+  const uid = requireAuth(context);
+  const gameId: string | undefined = data?.gameId;
+  if (!gameId) {
+    throw new functions.https.HttpsError("invalid-argument", "gameId is required.");
+  }
+
+  return db.runTransaction(async (tx) => {
+    const ref = db.collection("games").doc(gameId);
+    const snap = await tx.get(ref);
+    if (!snap.exists) {
+      throw new functions.https.HttpsError("not-found", "Game not found.");
+    }
+    const g = snap.data() as GameDoc;
+
+    // Only the two assigned players may ready up.
+    if (uid !== g.whiteId && uid !== g.blackId) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "You are not a player in this game."
+      );
+    }
+
+    // Already live or done → nothing to do (idempotent for late callers).
+    if (g.status === "active") {
+      return { gameId, status: "active", started: false };
+    }
+    if (g.status === "finished") {
+      return { gameId, status: "finished", started: false };
+    }
+
+    // Must be a pre-seated waiting game (both seats assigned). If blackId is
+    // still null this isn't a pre-seated game (e.g. a casual waiting game) —
+    // markReady doesn't apply; the casual joinGame path handles those.
+    if (g.status !== "waiting" || g.whiteId == null || g.blackId == null) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "This game is not awaiting both players."
+      );
+    }
+
+    const current = Array.isArray(g.ready) ? g.ready : [];
+    const ready = current.includes(uid) ? current : [...current, uid];
+
+    const bothReady =
+      ready.includes(g.whiteId) && ready.includes(g.blackId);
+
+    if (bothReady) {
+      // Activate: clock starts for white (turn 1). 90s grace is client-side.
+      tx.update(ref, {
+        ready,
+        status: "active",
+        lastMoveAt: now(), // white's clock starts now
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      // Both players: the game is now live (covers the case where one player
+      // readied earlier and wandered off — they get pulled back by this).
+      notifyTx(tx, {
+        recipientId: g.whiteId,
+        type: "game_activated",
+        title: "Your game is live",
+        body: "Both players are ready — the game has started.",
+        data: { gameId },
+      });
+      notifyTx(tx, {
+        recipientId: g.blackId,
+        type: "game_activated",
+        title: "Your game is live",
+        body: "Both players are ready — the game has started.",
+        data: { gameId },
+      });
+      return { gameId, status: "active", started: true };
+    }
+
+    // Only one player ready so far — stay waiting. Sticky: persist `ready`.
+    tx.update(ref, {
+      ready,
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+    return { gameId, status: "waiting", started: false };
   });
 });
 
@@ -465,4 +556,5 @@ export {
   initiateBreach,
   acceptBreachDefense,
   getBreachEligibility,
+  nominateGauntletDefender,
 } from "./conquest";

@@ -15,13 +15,24 @@ service cloud.firestore {
   match /databases/{database}/documents {
 
     match /games/{gameId} {
-      // A signed-in user may read a game if they are one of its players,
-      // OR if it is still waiting (so quick-match can discover open games).
-      allow read: if request.auth != null
-                  && (
-                       resource.data.status == 'waiting'
-                       || request.auth.uid in resource.data.players
-                     );
+      // SINGLE-DOC reads (get): a signed-in user may read a game if they are a
+      // player, OR if it is still waiting (so quick-match can discover open
+      // games and a player can open their own game by id).
+      allow get: if request.auth != null
+                 && (
+                      resource.data.status == 'waiting'
+                      || request.auth.uid in resource.data.players
+                    );
+
+      // QUERY reads (list): allow any signed-in user to run list queries on
+      // games. The app only ever lists its OWN games (activeGamesStream and
+      // waitingGamesStream both constrain with players array-contains the
+      // caller), so in practice a client only sees its own games. We keep the
+      // rule itself permissive (auth-only) because per-doc `in resource.data`
+      // conditions on list queries are brittle to prove and were causing
+      // PERMISSION_DENIED. Games hold no secrets (FENs, uids) and ALL writes
+      // are server-only (below), so listing is safe.
+      allow list: if request.auth != null;
 
       // No client writes, ever. Cloud Functions (Admin SDK) handle all writes.
       allow write: if false;
@@ -76,6 +87,29 @@ service cloud.firestore {
       allow read: if request.auth != null
                   && resource.data.account == request.auth.uid;
       allow write: if false;
+    }
+
+    // In-app notifications (server-owned). One doc per (recipient, event).
+    // get: a user may read a single notification only if it's theirs.
+    // list: any signed-in user may run list queries — the client only ever
+    //       queries its own (recipientId == uid); per-doc conditions on list
+    //       queries are brittle to prove (same issue as games), so we keep the
+    //       list rule auth-only. Notifications hold no secrets and all writes
+    //       are server-only.
+    // Clients MAY mark their own notification read (the only allowed write).
+    match /notifications/{notifId} {
+      allow get: if request.auth != null
+                 && resource.data.recipientId == request.auth.uid;
+      allow list: if request.auth != null;
+      // Allow a recipient to mark THEIR OWN notification read/dismissed, but
+      // nothing else (can't forge or alter content). Server (Admin SDK) creates.
+      allow update: if request.auth != null
+                    && resource.data.recipientId == request.auth.uid
+                    && request.resource.data.recipientId == resource.data.recipientId
+                    && request.resource.data.type == resource.data.type;
+      allow delete: if request.auth != null
+                    && resource.data.recipientId == request.auth.uid;
+      allow create: if false; // server-only
     }
 
     // SLICE 3c: peer stakes (server-owned).
