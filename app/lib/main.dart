@@ -118,21 +118,21 @@ class _GlobalNotificationBell extends StatelessWidget {
   Widget build(BuildContext context) {
     final uid = service.uid;
     if (uid == null) return const SizedBox.shrink();
-    return ValueListenableBuilder<int>(
-      valueListenable: gameScreensOpen,
-      builder: (context, openCount, _) {
-        if (openCount > 0) return const SizedBox.shrink();
-        return StreamBuilder<
-            List<QueryDocumentSnapshot<Map<String, dynamic>>>>(
-          stream: service.notificationsStream(),
-          builder: (context, snap) {
-            final docs = snap.data ?? const [];
-            if (docs.isEmpty) return const SizedBox.shrink();
-            final unread =
-                docs.where((d) => d.data()['read'] != true).length;
-            final scheme = Theme.of(context).colorScheme;
-            return Padding(
-              padding: const EdgeInsets.only(top: 4, right: 2),
+    // NOTE: the bell no longer hides on game screens. It sits bottom-right
+    // (clear of the board's controls), and the previous gameScreensOpen-based
+    // hiding was fragile — a missed decrement left the counter stuck > 0 and
+    // hid the bell on EVERY screen thereafter. Showing it whenever there are
+    // notifications is simpler and robust.
+    return StreamBuilder<
+        List<QueryDocumentSnapshot<Map<String, dynamic>>>>(
+      stream: service.notificationsStream(),
+      builder: (context, snap) {
+        final docs = snap.data ?? const [];
+        if (docs.isEmpty) return const SizedBox.shrink();
+        final unread = docs.where((d) => d.data()['read'] != true).length;
+        final scheme = Theme.of(context).colorScheme;
+        return Padding(
+          padding: const EdgeInsets.only(top: 4, right: 2),
               child: Material(
                 color: scheme.surface,
                 shape: const CircleBorder(),
@@ -178,8 +178,6 @@ class _GlobalNotificationBell extends StatelessWidget {
             );
           },
         );
-      },
-    );
   }
 
   void _openCenter(BuildContext context, GameService service) {
