@@ -28,6 +28,9 @@ export type NotificationType =
   | "stake_accepted" // proposer: your offer was accepted
   | "stake_declined" // proposer: your offer was declined
   | "breach_initiated" // circle members: a breach was mounted
+  | "breach_won" // breach winner (challenger or defender) — positive outcome
+  | "breach_lost" // breach loser — negative outcome
+  | "member_left" // owner: a member left your circle
   | "gauntlet_nominated" // defender: you were nominated for the gauntlet
   | "game_ready" // player: a staked game is waiting for you to ready up
   | "game_activated" // player: both ready — your game is live
@@ -99,6 +102,73 @@ export async function deleteOfferNotifications(stakeId: string): Promise<void> {
     console.error("deleteOfferNotifications failed", e);
   }
 }
+
+/**
+ * Delete the breach_initiated notifications fanned out to circle members, once
+ * the breach is resolved (won or failed). Matched by data.conquestId.
+ * Best-effort; never throws.
+ */
+export async function deleteBreachNotifications(
+  conquestId: string
+): Promise<void> {
+  if (!conquestId) return;
+  try {
+    const snap = await db
+      .collection("notifications")
+      .where("data.conquestId", "==", conquestId)
+      .where("type", "==", "breach_initiated")
+      .get();
+    if (snap.empty) return;
+    const batch = db.batch();
+    for (const d of snap.docs) {
+      batch.delete(d.ref);
+    }
+    await batch.commit();
+  } catch (e) {
+    console.error("deleteBreachNotifications failed", e);
+  }
+}
+
+/**
+ * Delete the transient call-to-action notifications tied to a conquest once it
+ * concludes (challenger_won / challenger_ejected). These are the prompts that
+ * become meaningless when the conquest is over: the gauntlet nomination prompt,
+ * any lingering breach_initiated fan-out, and per-game game_ready/game_activated
+ * notes. Terminal RESULT notifications (breach_won/breach_lost and the conquest
+ * result) are left for the user to read and dismiss. Matched by data.conquestId.
+ * Best-effort; never throws.
+ */
+export async function deleteConquestNotifications(
+  conquestId: string
+): Promise<void> {
+  if (!conquestId) return;
+  try {
+    const snap = await db
+      .collection("notifications")
+      .where("data.conquestId", "==", conquestId)
+      .get();
+    if (snap.empty) return;
+    const transient = new Set([
+      "gauntlet_nominated",
+      "breach_initiated",
+      "game_ready",
+      "game_activated",
+    ]);
+    const batch = db.batch();
+    let count = 0;
+    for (const d of snap.docs) {
+      const t = d.data().type as string | undefined;
+      if (t && transient.has(t)) {
+        batch.delete(d.ref);
+        count++;
+      }
+    }
+    if (count > 0) await batch.commit();
+  } catch (e) {
+    console.error("deleteConquestNotifications failed", e);
+  }
+}
+
 export function notifyManyTx(
   tx: FirebaseFirestore.Transaction,
   recipientIds: string[],

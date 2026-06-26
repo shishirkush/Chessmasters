@@ -49,7 +49,13 @@ import {
 import { challengeStakeAmount } from "./challenge";
 
 import { db } from "./init";
-import { notifyTx, notifyManyTx } from "./notify";
+import {
+  notify,
+  notifyTx,
+  notifyManyTx,
+  deleteBreachNotifications,
+  deleteConquestNotifications,
+} from "./notify";
 
 // Game constants — must match the engine's fresh active game (index.ts).
 const STARTING_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -181,14 +187,9 @@ export const getBreachEligibility = functions.https.onCall(
       }
     }
 
-    // One active conquest per attacker.
-    const myActive = await db
-      .collection("conquests")
-      .where("challengerId", "==", challengerId)
-      .where("status", "in", ACTIVE_STATUSES)
-      .limit(1)
-      .get();
-    if (!myActive.empty) return fail("active_conquest");
+    // NOTE (design #18, revised): concurrent conquests to different circles are
+    // allowed, so there is no per-attacker active-conquest gate here anymore.
+    // Only the per-circle breach lock applies.
 
     // One active breach per circle.
     const circleActive = await db
@@ -233,7 +234,13 @@ export const initiateBreach = functions.https.onCall(async (data, context) => {
     }
     const c = circleSnap.data()!;
     const ownerId: string = c.ownerId;
-    const members: string[] = Array.isArray(c.members) ? c.members : [];
+    // Defensive: a corrupted circle doc or malformed query could leave
+    // null / undefined / empty entries in members. Filter to valid non-empty
+    // string uids before the membership check or notification fan-out.
+    // (notifyManyTx also guards internally — this is defense in depth.)
+    const members: string[] = (
+      Array.isArray(c.members) ? c.members : []
+    ).filter((m: unknown): m is string => typeof m === "string" && m.length > 0);
 
     if (ownerId === challengerId) {
       throw new functions.https.HttpsError(
@@ -271,20 +278,12 @@ export const initiateBreach = functions.https.onCall(async (data, context) => {
     const challengerRating = (challengerSnap.get("rating") as number) ?? 1500;
     const challengerBal = await computeBalanceInTx(tx, challengerId);
 
-    // One active conquest per ATTACKER.
-    const myActive = await tx.get(
-      db
-        .collection("conquests")
-        .where("challengerId", "==", challengerId)
-        .where("status", "in", ACTIVE_STATUSES)
-        .limit(1)
-    );
-    if (!myActive.empty) {
-      throw new functions.https.HttpsError(
-        "failed-precondition",
-        "You already have an active conquest. Finish it first."
-      );
-    }
+    // NOTE (design #18, revised): a challenger MAY hold multiple concurrent
+    // conquests against DIFFERENT circles — the per-attacker limit was removed
+    // to support aggressive play during the breach-accept window. Over-extension
+    // is bounded naturally: each breach locks its OWN stake, so a challenger can
+    // only mount as many as their CP balance covers. The one-active-breach-PER-
+    // CIRCLE guard below still stands (two challengers can't breach one circle).
 
     // One active breach per CIRCLE (first-come holds it; no displacement in V1).
     const circleActive = await tx.get(
@@ -756,6 +755,13 @@ export async function settleConquest(
 ): Promise<void> {
   const conquestRef = db.collection("conquests").doc(conquestId);
 
+  // Set inside the tx when the breach branch resolves, so we can clean up the
+  // breach_initiated member notifications afterward (non-transactional).
+  let breachResolved = false;
+  // Set when the gauntlet reaches a terminal state, so we can clear the stale
+  // transient conquest notifications afterward (non-transactional).
+  let conquestConcluded = false;
+
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(conquestRef);
     if (!snap.exists) {
@@ -767,6 +773,7 @@ export async function settleConquest(
     // ---- BREACH branch ----
     if (q.breachGameId === gameId) {
       if (q.status !== "breach_defense_active") return; // idempotent no-op
+      breachResolved = true;
 
       const challengerId: string = q.challengerId;
       const defenderId: string = q.breachDefenderId;
@@ -812,6 +819,32 @@ export async function settleConquest(
           status: "gauntlet_pending" as ConquestStatus,
           updatedAt: FieldValue.serverTimestamp(),
         });
+        // Notify both: the challenger breached the wall and advances; the
+        // defender's circle wall was breached.
+        notifyTx(tx, {
+          recipientId: challengerId,
+          type: "breach_won",
+          title: "Breach successful!",
+          body: "You breached the wall. Your stake is refunded — on to the Gauntlet.",
+          data: { conquestId, circleId: q.circleId, gameId },
+        });
+        notifyTx(tx, {
+          recipientId: defenderId,
+          type: "breach_lost",
+          title: "Your wall was breached",
+          body: "The challenger won the breach. The Gauntlet now defends your circle.",
+          data: { conquestId, circleId: q.circleId, gameId },
+        });
+        // Prompt the circle OWNER to nominate a Gauntlet defender. Without this
+        // the conquest sits at gauntlet_pending with no one told to act, so the
+        // Gauntlet never starts. The owner taps this → Circle page → nominate.
+        notifyTx(tx, {
+          recipientId: q.ownerId,
+          type: "gauntlet_nominated",
+          title: "Nominate a Gauntlet defender",
+          body: "Your wall was breached. Nominate a member to defend the Gauntlet.",
+          data: { conquestId, circleId: q.circleId },
+        });
         return;
       }
 
@@ -838,6 +871,25 @@ export async function settleConquest(
       tx.update(conquestRef, {
         status: "breach_failed" as ConquestStatus,
         updatedAt: FieldValue.serverTimestamp(),
+      });
+      // Notify both: the challenger lost the breach (stake forfeited); the
+      // defender successfully defended their circle.
+      notifyTx(tx, {
+        recipientId: challengerId,
+        type: "breach_lost",
+        title: "Breach failed",
+        body:
+          result === "draw"
+            ? "The breach drew — the wall holds. Your stake went to the defender."
+            : "You lost the breach. Your stake went to the defender.",
+        data: { conquestId, circleId: q.circleId, gameId },
+      });
+      notifyTx(tx, {
+        recipientId: defenderId,
+        type: "breach_won",
+        title: "Circle defended!",
+        body: "You repelled the breach and kept your circle. The forfeited stake is yours.",
+        data: { conquestId, circleId: q.circleId, gameId },
       });
       return;
     }
@@ -1003,6 +1055,32 @@ export async function settleConquest(
           status: "challenger_won" as ConquestStatus,
           updatedAt: FieldValue.serverTimestamp(),
         });
+        // Conquest over — challenger took the circle. Notify both sides and the
+        // owner, then flag the stale transient notifications for cleanup.
+        notifyTx(tx, {
+          recipientId: challengerId,
+          type: "breach_won",
+          title: "Conquest won!",
+          body: "You won the Gauntlet and joined the circle.",
+          data: { conquestId, circleId: q.circleId },
+        });
+        notifyTx(tx, {
+          recipientId: defenderId,
+          type: "breach_lost",
+          title: "The Gauntlet fell",
+          body: "The challenger won the Gauntlet and joined your circle.",
+          data: { conquestId, circleId: q.circleId },
+        });
+        if (q.ownerId && q.ownerId !== defenderId) {
+          notifyTx(tx, {
+            recipientId: q.ownerId,
+            type: "breach_lost",
+            title: "Your circle was conquered",
+            body: "The challenger won the Gauntlet and joined your circle.",
+            data: { conquestId, circleId: q.circleId },
+          });
+        }
+        conquestConcluded = true;
         return;
       }
 
@@ -1017,6 +1095,32 @@ export async function settleConquest(
           status: "challenger_ejected" as ConquestStatus,
           updatedAt: FieldValue.serverTimestamp(),
         });
+        // Conquest over — the Gauntlet held. Notify both sides and the owner,
+        // then flag the stale transient notifications for cleanup.
+        notifyTx(tx, {
+          recipientId: defenderId,
+          type: "breach_won",
+          title: "Gauntlet defended!",
+          body: "You held the Gauntlet and repelled the challenger.",
+          data: { conquestId, circleId: q.circleId },
+        });
+        notifyTx(tx, {
+          recipientId: challengerId,
+          type: "breach_lost",
+          title: "Conquest failed",
+          body: "The Gauntlet held. Your conquest was repelled.",
+          data: { conquestId, circleId: q.circleId },
+        });
+        if (q.ownerId && q.ownerId !== defenderId) {
+          notifyTx(tx, {
+            recipientId: q.ownerId,
+            type: "breach_won",
+            title: "Your circle held",
+            body: "The Gauntlet defended your circle against the challenger.",
+            data: { conquestId, circleId: q.circleId },
+          });
+        }
+        conquestConcluded = true;
         return;
       }
 
@@ -1084,7 +1188,139 @@ export async function settleConquest(
     console.error(
       "settleConquest: gameId matched neither breach nor current gauntlet game",
       conquestId,
-      gameId
+      gameId,
+      `breachGameId=${q.breachGameId}`,
+      `gauntletCurrentGameId=${q.gauntlet?.currentGameId ?? "none"}`,
+      `status=${q.status}`
     );
   });
+
+  // After a resolved breach, remove the now-stale breach_initiated
+  // notifications that were fanned out to all circle members.
+  if (breachResolved) {
+    await deleteBreachNotifications(conquestId);
+  }
+  // After the gauntlet concludes, clear the stale transient conquest
+  // notifications (nomination prompt, per-game game_ready, any breach fan-out).
+  if (conquestConcluded) {
+    await deleteConquestNotifications(conquestId);
+  }
+}
+
+// ---- forceCloseConquestsForCircle -----------------------------------------
+/**
+ * Force-close every active conquest mounted against a circle that is being
+ * deleted (or otherwise orphaned). Per design checklist #14, a force-close
+ * refunds the challenger's locked breach stake. Each conquest is settled in its
+ * own transaction (idempotent on already-settled stakes), and the breach
+ * notifications are cleaned up afterward.
+ *
+ * Handles the breach-phase stake (the only CP the challenger has locked in
+ * breach_pending / breach_defense_active). If a Gauntlet is mid-flight the
+ * gauntlet stake is the DEFENDER's; that is also refunded if present and
+ * unsettled. Best-effort and safe to call even when there are no conquests.
+ */
+export async function forceCloseConquestsForCircle(
+  circleId: string
+): Promise<void> {
+  if (!circleId) return;
+  const activeSnap = await db
+    .collection("conquests")
+    .where("circleId", "==", circleId)
+    .where("status", "in", ACTIVE_STATUSES)
+    .get();
+  if (activeSnap.empty) return;
+
+  for (const cDoc of activeSnap.docs) {
+    const conquestId = cDoc.id;
+    const conquestRef = cDoc.ref;
+    let challengerToNotify: string | null = null;
+    try {
+      await db.runTransaction(async (tx) => {
+        const snap = await tx.get(conquestRef);
+        if (!snap.exists) return;
+        const q = snap.data()!;
+        if (!ACTIVE_STATUSES.includes(q.status)) return; // already resolved
+
+        challengerToNotify = q.challengerId ?? null;
+
+        // Refund the breach stake (challenger's locked CP) if unsettled.
+        if (q.breachStakeId) {
+          const bRef = db.collection("stakes").doc(q.breachStakeId);
+          const bSnap = await tx.get(bRef);
+          if (bSnap.exists && bSnap.data()!.settled !== true) {
+            const amt = bSnap.data()!.issuerStake ?? 0;
+            if (amt > 0) {
+              appendEntry(tx, {
+                account: q.challengerId,
+                amount: amt,
+                type: "stake_return",
+                meta: {
+                  stakeId: q.breachStakeId,
+                  conquestId,
+                  kind: "breach",
+                  outcome: "force_close_refund",
+                },
+              });
+            }
+            tx.update(bRef, {
+              status: "settled",
+              settled: true,
+              settledResult: "force_closed",
+              updatedAt: FieldValue.serverTimestamp(),
+            });
+          }
+        }
+
+        // If a Gauntlet stake is live (the DEFENDER's CP), refund it too.
+        const gStakeId = q.gauntlet?.currentStakeId;
+        if (gStakeId) {
+          const gRef = db.collection("stakes").doc(gStakeId);
+          const gSnap = await tx.get(gRef);
+          if (gSnap.exists && gSnap.data()!.settled !== true) {
+            const gAmt = gSnap.data()!.issuerStake ?? 0;
+            const gAccount = gSnap.data()!.issuerId;
+            if (gAmt > 0 && gAccount) {
+              appendEntry(tx, {
+                account: gAccount,
+                amount: gAmt,
+                type: "stake_return",
+                meta: {
+                  stakeId: gStakeId,
+                  conquestId,
+                  kind: "gauntlet",
+                  outcome: "force_close_refund",
+                },
+              });
+            }
+            tx.update(gRef, {
+              status: "settled",
+              settled: true,
+              settledResult: "force_closed",
+              updatedAt: FieldValue.serverTimestamp(),
+            });
+          }
+        }
+
+        tx.update(conquestRef, {
+          status: "force_closed" as ConquestStatus,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      });
+
+      // Notify the challenger their conquest was force-closed (circle gone).
+      if (challengerToNotify) {
+        await notify({
+          recipientId: challengerToNotify,
+          type: "expired",
+          title: "Conquest closed",
+          body: "A circle you were breaching was removed. Your breach stake was refunded.",
+          data: { conquestId, circleId },
+        });
+      }
+      await deleteBreachNotifications(conquestId);
+    } catch (e) {
+      console.error("forceCloseConquestsForCircle failed", conquestId, e);
+    }
+  }
 }

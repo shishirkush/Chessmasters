@@ -39,6 +39,49 @@ Future<void> main() async {
 final GlobalKey<NavigatorState> rootNavigatorKey =
     GlobalKey<NavigatorState>();
 
+/// True whenever a game board (GameScreen) is the top-most route. Driven by a
+/// NavigatorObserver below — push/pop are guaranteed paired by the framework, so
+/// unlike a hand-maintained initState/dispose counter this can NEVER desync and
+/// leave the bell/banner wrongly hidden. Replaces the old `gameScreensOpen`
+/// integer counter that kept leaking.
+final ValueNotifier<bool> gameRouteOnTop = ValueNotifier<bool>(false);
+
+/// Observes route changes on the root navigator and flips `gameRouteOnTop` when
+/// a GameScreen is pushed/popped. Any route whose settings.name is 'game' (or
+/// whose widget is a GameScreen) counts. We recompute from the live stack on
+/// every transition rather than incrementing, so it's always exactly correct.
+class _GameRouteObserver extends NavigatorObserver {
+  void _recompute() {
+    // Defer to post-frame: navigator notifies observers mid-transition, and we
+    // must not mutate a ValueNotifier that global widgets listen to during their
+    // build. Post-frame is safe.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      gameRouteOnTop.value = _topIsGame;
+    });
+  }
+
+  bool _topIsGame = false;
+  void _set(Route<dynamic>? top) {
+    _topIsGame = top?.settings.name == 'game';
+    _recompute();
+  }
+
+  @override
+  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) =>
+      _set(route);
+  @override
+  void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) =>
+      _set(previousRoute);
+  @override
+  void didRemove(Route<dynamic> route, Route<dynamic>? previousRoute) =>
+      _set(previousRoute);
+  @override
+  void didReplace({Route<dynamic>? newRoute, Route<dynamic>? oldRoute}) =>
+      _set(newRoute);
+}
+
+final _GameRouteObserver gameRouteObserver = _GameRouteObserver();
+
 /// A single shared GameService for the whole app (so the global banner and the
 /// screens read the same auth/uid).
 final GameService rootService = GameService();
@@ -51,6 +94,7 @@ class ChessMastersApp extends StatelessWidget {
     return MaterialApp(
       title: 'Chess Masters',
       navigatorKey: rootNavigatorKey,
+      navigatorObservers: [gameRouteObserver],
       theme: ThemeData(
         useMaterial3: true,
         colorSchemeSeed: const Color(0xFF3B5B92),
@@ -110,29 +154,76 @@ class _GlobalWaitingOverlay extends StatelessWidget {
 /// A floating bell (top-right, on every screen) with an unread badge. Tapping
 /// opens the notification center. Hidden while a game board is open and when
 /// signed out.
-class _GlobalNotificationBell extends StatelessWidget {
+class _GlobalNotificationBell extends StatefulWidget {
   final GameService service;
   const _GlobalNotificationBell({required this.service});
 
   @override
+  State<_GlobalNotificationBell> createState() =>
+      _GlobalNotificationBellState();
+}
+
+class _GlobalNotificationBellState extends State<_GlobalNotificationBell> {
+  // Cache the stream per signed-in user. Creating service.notificationsStream()
+  // inside build() spawns a new Firestore listener on every rebuild; with this
+  // widget rebuilding on every route change, listeners pile up until the
+  // emulator throttles the connection (too_many_pings) and drops OTHER streams
+  // (which starved the waiting-game banner). So we cache — but we must (re)build
+  // the stream when the user changes, because this widget mounts ABOVE auth (in
+  // MaterialApp.builder) and first runs initState BEFORE anyone is signed in.
+  Stream<List<QueryDocumentSnapshot<Map<String, dynamic>>>>? _stream;
+  String? _streamUid;
+  StreamSubscription<User?>? _authSub;
+
+  @override
+  void initState() {
+    super.initState();
+    _syncStream();
+    // Rebuild the cached stream whenever auth changes (sign-in/out). This is the
+    // key fix: at first build no one is signed in, so we can't create the stream
+    // yet — we create it the moment a user appears.
+    _authSub = widget.service.authStateChanges().listen((_) {
+      if (mounted) setState(_syncStream);
+    });
+  }
+
+  void _syncStream() {
+    final uid = widget.service.uid;
+    if (uid != _streamUid) {
+      _streamUid = uid;
+      _stream = uid == null ? null : widget.service.notificationsStream();
+    }
+  }
+
+  @override
+  void dispose() {
+    _authSub?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final uid = service.uid;
-    if (uid == null) return const SizedBox.shrink();
-    // NOTE: the bell no longer hides on game screens. It sits bottom-right
-    // (clear of the board's controls), and the previous gameScreensOpen-based
-    // hiding was fragile — a missed decrement left the counter stuck > 0 and
-    // hid the bell on EVERY screen thereafter. Showing it whenever there are
-    // notifications is simpler and robust.
-    return StreamBuilder<
-        List<QueryDocumentSnapshot<Map<String, dynamic>>>>(
-      stream: service.notificationsStream(),
-      builder: (context, snap) {
-        final docs = snap.data ?? const [];
-        if (docs.isEmpty) return const SizedBox.shrink();
-        final unread = docs.where((d) => d.data()['read'] != true).length;
-        final scheme = Theme.of(context).colorScheme;
-        return Padding(
-          padding: const EdgeInsets.only(top: 4, right: 2),
+    final uid = widget.service.uid;
+    if (uid == null || _stream == null) return const SizedBox.shrink();
+    final service = widget.service;
+    // The bell is visible on every screen EXCEPT an open game board. It uses
+    // gameRouteOnTop, driven by a NavigatorObserver (push/pop are framework-
+    // paired, so it never desyncs). Everywhere off the board the bell is ALWAYS
+    // present (even with zero notifications); only the red BADGE is conditional.
+    return ValueListenableBuilder<bool>(
+      valueListenable: gameRouteOnTop,
+      builder: (context, onBoard, _) {
+        if (onBoard) return const SizedBox.shrink();
+        return StreamBuilder<
+            List<QueryDocumentSnapshot<Map<String, dynamic>>>>(
+          stream: _stream,
+          builder: (context, snap) {
+            final docs = snap.data ?? const [];
+            final unread =
+                docs.where((d) => d.data()['read'] != true).length;
+            final scheme = Theme.of(context).colorScheme;
+            return Padding(
+              padding: const EdgeInsets.only(top: 4, right: 2),
               child: Material(
                 color: scheme.surface,
                 shape: const CircleBorder(),
@@ -178,6 +269,8 @@ class _GlobalNotificationBell extends StatelessWidget {
             );
           },
         );
+      },
+    );
   }
 
   void _openCenter(BuildContext context, GameService service) {
@@ -220,6 +313,12 @@ class _NotificationCenter extends StatelessWidget {
         return Icons.handshake;
       case 'breach_initiated':
         return Icons.shield;
+      case 'breach_won':
+        return Icons.emoji_events;
+      case 'breach_lost':
+        return Icons.heart_broken;
+      case 'member_left':
+        return Icons.person_remove;
       case 'gauntlet_nominated':
         return Icons.military_tech;
       case 'game_ready':
@@ -271,6 +370,7 @@ class _NotificationCenter extends StatelessWidget {
       Future.microtask(() {
         rootNavigatorKey.currentState?.push(
           MaterialPageRoute(
+            settings: const RouteSettings(name: 'game'),
             builder: (_) => GameScreen(gameId: gameId, service: service),
           ),
         );
@@ -288,6 +388,7 @@ class _NotificationCenter extends StatelessWidget {
         type == 'join_request' ||
         type == 'join_approved' ||
         type == 'breach_initiated' ||
+        type == 'member_left' ||
         type == 'gauntlet_nominated';
     if (isCircleAction && circleId != null) {
       // Don't delete these — the action (accept/approve) still needs to be
@@ -386,11 +487,6 @@ class _NotificationCenter extends StatelessWidget {
   }
 }
 
-/// Tracks how many GameScreens are currently open, so the global waiting
-/// banner can hide itself while a board is on screen (the board shows its own
-/// waiting state). A ValueNotifier so the banner rebuilds when it changes.
-final ValueNotifier<int> gameScreensOpen = ValueNotifier<int>(0);
-
 /// An error strip that the user can dismiss (×), so a transient error can never
 /// permanently cover UI beneath the global overlay.
 class _DismissibleErrorStrip extends StatefulWidget {
@@ -440,24 +536,60 @@ class _DismissibleErrorStripState extends State<_DismissibleErrorStrip> {
 /// The actual banner content: watches waitingGamesStream and shows a compact,
 /// tappable strip when the player has a game waiting to start. Hidden entirely
 /// when there is no waiting game. Uses the root navigator to enter the board.
-class _GlobalWaitingBanner extends StatelessWidget {
+class _GlobalWaitingBanner extends StatefulWidget {
   final GameService service;
   const _GlobalWaitingBanner({required this.service});
 
   @override
+  State<_GlobalWaitingBanner> createState() => _GlobalWaitingBannerState();
+}
+
+class _GlobalWaitingBannerState extends State<_GlobalWaitingBanner> {
+  // Cache the waiting-games stream per signed-in user (see _GlobalNotificationBell
+  // for the full rationale). Must (re)create on auth change: this widget mounts
+  // ABOVE auth and first runs initState before anyone is signed in.
+  Stream<List<QueryDocumentSnapshot<Map<String, dynamic>>>>? _stream;
+  String? _streamUid;
+  StreamSubscription<User?>? _authSub;
+
+  @override
+  void initState() {
+    super.initState();
+    _syncStream();
+    _authSub = widget.service.authStateChanges().listen((_) {
+      if (mounted) setState(_syncStream);
+    });
+  }
+
+  void _syncStream() {
+    final uid = widget.service.uid;
+    if (uid != _streamUid) {
+      _streamUid = uid;
+      _stream = uid == null ? null : widget.service.waitingGamesStream();
+    }
+  }
+
+  @override
+  void dispose() {
+    _authSub?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final service = widget.service;
     final uid = service.uid;
     final scheme = Theme.of(context).colorScheme;
 
-    if (uid == null) return const SizedBox.shrink();
+    if (uid == null || _stream == null) return const SizedBox.shrink();
 
-    return ValueListenableBuilder<int>(
-      valueListenable: gameScreensOpen,
-      builder: (context, openCount, _) {
-        if (openCount > 0) return const SizedBox.shrink();
+    return ValueListenableBuilder<bool>(
+      valueListenable: gameRouteOnTop,
+      builder: (context, onBoard, _) {
+        if (onBoard) return const SizedBox.shrink();
         return StreamBuilder<
             List<QueryDocumentSnapshot<Map<String, dynamic>>>>(
-          stream: service.waitingGamesStream(),
+          stream: _stream,
           builder: (context, snap) {
             // Only surface real errors (quietly); otherwise stay invisible when
             // there's nothing to show. Dismissible so it can never block UI.
@@ -526,6 +658,7 @@ class _GlobalWaitingBanner extends StatelessWidget {
                         onPressed: () {
                           rootNavigatorKey.currentState?.push(
                             MaterialPageRoute(
+                              settings: const RouteSettings(name: 'game'),
                               builder: (_) =>
                                   GameScreen(gameId: d.id, service: service),
                             ),
@@ -538,6 +671,7 @@ class _GlobalWaitingBanner extends StatelessWidget {
                         onPressed: () {
                           rootNavigatorKey.currentState?.push(
                             MaterialPageRoute(
+                              settings: const RouteSettings(name: 'game'),
                               builder: (_) =>
                                   GameScreen(gameId: d.id, service: service),
                             ),
@@ -774,6 +908,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_currentGameId != null) return; // already on a board
     _currentGameId = gameId;
     await Navigator.of(context).push(MaterialPageRoute(
+      settings: const RouteSettings(name: 'game'),
       builder: (_) => GameScreen(gameId: gameId, service: _service),
     ));
     // Returned from the board (game over or user backed out).
@@ -871,6 +1006,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         backgroundColor: Colors.green.shade700),
                     onPressed: () => Navigator.of(context).push(
                       MaterialPageRoute(
+                        settings: const RouteSettings(name: 'game'),
                         builder: (_) =>
                             GameScreen(gameId: gameId, service: _service),
                       ),
@@ -991,14 +1127,8 @@ class _GameScreenState extends State<GameScreen> {
   @override
   void initState() {
     super.initState();
-    // Suppress the global waiting-banner/bell while this board is open. Defer
-    // the mutation to AFTER this frame: incrementing during initState notifies
-    // the global ValueListenableBuilder (bell/banner) to rebuild WHILE the tree
-    // is still building, which throws "setState during build" and destabilizes
-    // the app (auth churn, reconnect storms). Post-frame is safe.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      gameScreensOpen.value += 1;
-    });
+    // The global bell/banner hide themselves while a board is on top via the
+    // NavigatorObserver (gameRouteOnTop) — no per-screen counter to manage here.
     // Ready-gate: signal presence as soon as this board opens. For a pre-seated
     // staked/conquest game in `waiting`, this adds us to `ready`; the game
     // activates (clock starts) only once BOTH players have done so. For casual
@@ -1019,10 +1149,6 @@ class _GameScreenState extends State<GameScreen> {
 
   @override
   void dispose() {
-    // Mirror the deferred increment. Guard against underflow.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (gameScreensOpen.value > 0) gameScreensOpen.value -= 1;
-    });
     _ticker?.cancel();
     super.dispose();
   }
@@ -1416,6 +1542,7 @@ class _ConquestNextStep extends StatelessWidget {
                         // Replace this finished board with the next game.
                         Navigator.of(context).pushReplacement(
                           MaterialPageRoute(
+                            settings: const RouteSettings(name: 'game'),
                             builder: (_) => GameScreen(
                               gameId: currentGameId,
                               service: service,
@@ -1777,6 +1904,14 @@ class CircleDetailScreen extends StatelessWidget {
                     .compareTo(b['uid'] as String? ?? '');
               });
 
+              // My own position in the ranked list. Challenge-up is only valid
+              // against players ranked ABOVE me (design §: the lower-ranked
+              // player challenges up for a rating climb). If I'm not found
+              // (shouldn't happen for a member), default to last so no Challenge
+              // buttons show.
+              final myIndex = profiles.indexWhere((p) => p['uid'] == myUid);
+              final myRank = myIndex < 0 ? profiles.length : myIndex;
+
               return Column(
                 children: [
                   Padding(
@@ -1864,23 +1999,28 @@ class CircleDetailScreen extends StatelessWidget {
                                   child: const Text('Stake'),
                                 ),
                                 const SizedBox(width: 4),
-                                OutlinedButton(
-                                  style: OutlinedButton.styleFrom(
-                                    padding: const EdgeInsets.symmetric(
-                                        horizontal: 10),
-                                    visualDensity: VisualDensity.compact,
-                                    foregroundColor: Colors.deepOrange,
+                                // Challenge-up only targets players ranked ABOVE
+                                // me (a shot at a rating climb against a stronger
+                                // player). i < myRank means this member outranks
+                                // me, so the button is shown; otherwise hidden.
+                                if (i < myRank)
+                                  OutlinedButton(
+                                    style: OutlinedButton.styleFrom(
+                                      padding: const EdgeInsets.symmetric(
+                                          horizontal: 10),
+                                      visualDensity: VisualDensity.compact,
+                                      foregroundColor: Colors.deepOrange,
+                                    ),
+                                    onPressed: () => _showChallengeDialog(
+                                      context,
+                                      service,
+                                      opponentId: memberUid,
+                                      opponentName:
+                                          p['displayName'] as String? ?? 'Player',
+                                      circleId: circleId,
+                                    ),
+                                    child: const Text('Challenge'),
                                   ),
-                                  onPressed: () => _showChallengeDialog(
-                                    context,
-                                    service,
-                                    opponentId: memberUid,
-                                    opponentName:
-                                        p['displayName'] as String? ?? 'Player',
-                                    circleId: circleId,
-                                  ),
-                                  child: const Text('Challenge'),
-                                ),
                               ],
                             ],
                           ),
@@ -2283,6 +2423,7 @@ class _BreachDefendBanner extends StatelessWidget {
                         await service.acceptBreachDefense(conquestId);
                     if (context.mounted) {
                       Navigator.of(context).push(MaterialPageRoute(
+                        settings: const RouteSettings(name: 'game'),
                         builder: (_) =>
                             GameScreen(service: service, gameId: gameId),
                       ));
@@ -2442,6 +2583,7 @@ Future<void> _showNominateDialog(
                                           dialogContext.mounted) {
                                         Navigator.of(dialogContext).push(
                                           MaterialPageRoute(
+                                            settings: const RouteSettings(name: 'game'),
                                             builder: (_) => GameScreen(
                                               gameId: gameId,
                                               service: service,

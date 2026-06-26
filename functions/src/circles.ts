@@ -34,6 +34,7 @@ import { FieldValue } from "firebase-admin/firestore";
 
 import { db } from "./init";
 import { notifyTx } from "./notify";
+import { forceCloseConquestsForCircle } from "./conquest";
 
 const MAX_NAME_LEN = 40;
 const MIN_NAME_LEN = 2;
@@ -118,12 +119,14 @@ export const leaveCircle = functions.https.onCall(async (data, context) => {
   }
 
   const circleRef = db.collection("circles").doc(circleId);
+  const userRef = db.collection("users").doc(uid);
 
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(circleRef);
     if (!snap.exists) {
       throw new functions.https.HttpsError("not-found", "Circle not found.");
     }
+    const userSnap = await tx.get(userRef);
     const c = snap.data()!;
     const members: string[] = Array.isArray(c.members) ? c.members : [];
 
@@ -146,6 +149,19 @@ export const leaveCircle = functions.https.onCall(async (data, context) => {
       memberCount: Math.max(0, (c.memberCount ?? members.length) - 1),
       updatedAt: FieldValue.serverTimestamp(),
     });
+
+    // Let the owner know a member left (they may want to refill the circle).
+    const leaverName =
+      (userSnap.exists ? userSnap.data()?.displayName : null) ?? "A member";
+    if (c.ownerId && c.ownerId !== uid) {
+      notifyTx(tx, {
+        recipientId: c.ownerId,
+        type: "member_left",
+        title: "A member left your circle",
+        body: `${leaverName} left ${c.name ?? "your circle"}.`,
+        data: { circleId, memberUid: uid },
+      });
+    }
   });
 
   return { ok: true };
@@ -169,6 +185,24 @@ export const deleteCircle = functions.https.onCall(async (data, context) => {
   const circleRef = db.collection("circles").doc(circleId);
   const userRef = db.collection("users").doc(uid);
 
+  // Verify ownership first (cheap read) before doing the heavier conquest
+  // cleanup. The full delete happens in the transaction below.
+  const preSnap = await circleRef.get();
+  if (!preSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Circle not found.");
+  }
+  if (preSnap.data()?.ownerId !== uid) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only the owner can delete this circle."
+    );
+  }
+
+  // Force-close any active conquest mounted against this circle and refund the
+  // escrowed breach (and live gauntlet) stakes BEFORE deletion — otherwise the
+  // conquest would orphan and keep blocking/holding CP. (Was a known TODO.)
+  await forceCloseConquestsForCircle(circleId);
+
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(circleRef);
     if (!snap.exists) {
@@ -180,8 +214,6 @@ export const deleteCircle = functions.https.onCall(async (data, context) => {
         "Only the owner can delete this circle."
       );
     }
-    // NOTE (slice 4): force-close any active conquest on this circle and
-    // refund escrowed CP before deletion.
 
     tx.delete(circleRef);
     tx.set(

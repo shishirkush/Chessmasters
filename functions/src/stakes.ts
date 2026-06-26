@@ -603,6 +603,20 @@ export const proposeChallengeUp = functions.https.onCall(
       throw new functions.https.HttpsError("not-found", "Player not found.");
     }
 
+    // Challenge-UP direction (design): the challenger must be LOWER-rated than
+    // the opponent — it's a shot at climbing against a stronger player. Equal
+    // or higher-rated challengers are rejected (use a peer stake instead).
+    const issuerSnap = await db.collection("users").doc(issuerId).get();
+    const issuerRating = (issuerSnap.get("rating") as number) ?? 1500;
+    const opponentRating = (oppSnap.get("rating") as number) ?? 1500;
+    if (issuerRating >= opponentRating) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Challenge-up only works against a higher-rated player. " +
+          "Use a peer stake for someone at or below your rating."
+      );
+    }
+
     // One pending challenge per (issuer, opponent) pair.
     const dupe = await db
       .collection("stakes")

@@ -24,6 +24,7 @@ import { updatePlayer, RatingState } from "./glicko";
 import { START_RATING, START_RD, START_VOL } from "./users";
 import { grantDailyAllotment } from "./ledger";
 import { settleStakeForGame } from "./stakes";
+import { settleConquest } from "./conquest";
 
 import { db } from "./init";
 
@@ -176,6 +177,30 @@ export const onGameFinished = functions.firestore
         );
       } catch (e) {
         console.error("stake settlement failed", e);
+      }
+    }
+
+    // ---- Conquest settlement (breach + gauntlet) --------------------------
+    // Breach and gauntlet games are linked to their conquest via contextId.
+    // When one finishes, advance the conquest: a finished breach moves it to
+    // gauntlet_pending (and notifies the owner to nominate); a finished gauntlet
+    // game tallies the best-of-3 and either chains the next game or settles the
+    // conquest. settleConquest is idempotent (guards on conquest status + the
+    // stake's settled flag), so a trigger retry is harmless. WITHOUT this call
+    // the breach game would rate normally but the conquest would never advance
+    // and the Gauntlet would never mount.
+    if (
+      (after.gameType === "breach" || after.gameType === "gauntlet") &&
+      typeof after.contextId === "string"
+    ) {
+      try {
+        await settleConquest(
+          context.params.gameId,
+          after.contextId,
+          result
+        );
+      } catch (e) {
+        console.error("conquest settlement failed", e);
       }
     }
 
