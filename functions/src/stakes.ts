@@ -36,7 +36,7 @@ import * as admin from "firebase-admin";
 import { FieldValue } from "firebase-admin/firestore";
 import {
   appendEntry,
-  computeBalanceInTx,
+  readCpInTx,
   computeBalance,
   settlePot,
   SINK_ACCOUNT,
@@ -294,8 +294,8 @@ export const acceptStake = functions.https.onCall(async (data, context) => {
     const amount: number = s.amount;
 
     // Live, transaction-consistent spendable balances (escrow already netted).
-    const issuerBal = await computeBalanceInTx(tx, issuerId);
-    const opponentBal = await computeBalanceInTx(tx, opponentId);
+    const issuerBal = await readCpInTx(tx, issuerId);
+    const opponentBal = await readCpInTx(tx, opponentId);
 
     // Anti-collusion cap: ≤3 games/day vs the same opponent (any game type).
     const issuerCounts = await getCountsInTx(tx, issuerId);
@@ -726,8 +726,8 @@ export const acceptChallengeUp = functions.https.onCall(
       const opponentRating =
         (opponentProfileSnap.get("rating") as number) ?? 1500;
 
-      const issuerBal = await computeBalanceInTx(tx, issuerId);
-      const opponentBal = await computeBalanceInTx(tx, opponentId);
+      const issuerBal = await readCpInTx(tx, issuerId);
+      const opponentBal = await readCpInTx(tx, opponentId);
 
       // Same-opponent daily cap (both directions).
       const issuerCounts = await getCountsInTx(tx, issuerId);

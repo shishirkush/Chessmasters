@@ -123,6 +123,34 @@ export function appendEntry(tx: Transaction, entry: LedgerEntryInput): void {
     meta: entry.meta ?? null,
     createdAt: FieldValue.serverTimestamp(),
   });
+  // Maintain the denormalized `cp` CACHE on the user doc, ATOMICALLY in the
+  // same transaction as the ledger append. This is the single chokepoint: every
+  // CP movement goes through appendEntry, so it is structurally impossible to
+  // write a ledger entry without updating the cache — they commit together.
+  //
+  // The ledger remains the SOURCE OF TRUTH; `cp` is a read-optimization only.
+  // FieldValue.increment treats a missing field as 0, so the first entry for a
+  // user (the starting grant) correctly initializes it. The sink is not a user
+  // doc, so we don't cache it (its balance is still fully tracked in the ledger
+  // for conservation proofs). updateCpCache() must precede any reads? No —
+  // increment is a blind WRITE, valid after the reads-before-writes boundary.
+  updateCpCacheInTx(tx, entry.account, entry.amount);
+}
+
+/**
+ * Apply a `cp` delta to a user's cached balance inside a transaction. Blind
+ * write (FieldValue.increment), so it's valid in the writes phase of a tx.
+ * Skips the sink (not a user doc). Kept as a named helper so the cache-update
+ * rule lives in exactly one place.
+ */
+function updateCpCacheInTx(
+  tx: Transaction,
+  account: string,
+  delta: number
+): void {
+  if (account === SINK_ACCOUNT) return;
+  const userRef = db.collection("users").doc(account);
+  tx.set(userRef, { cp: FieldValue.increment(delta) }, { merge: true });
 }
 
 /**
@@ -139,13 +167,20 @@ export async function appendUniqueEntry(
 ): Promise<boolean> {
   const ref = db.collection("ledger").doc(docId);
   try {
-    await ref.create({
-      account: entry.account,
-      amount: entry.amount,
-      type: entry.type,
-      gameId: entry.gameId ?? null,
-      meta: entry.meta ?? null,
-      createdAt: FieldValue.serverTimestamp(),
+    // Do the create AND the cp-cache increment in ONE transaction so a faucet
+    // entry and its cache update commit together (no drift window). tx.create
+    // throws ALREADY_EXISTS on a repeat, preserving exactly-once idempotency —
+    // and because it's in the tx, a repeat also skips the increment.
+    await db.runTransaction(async (tx: Transaction) => {
+      tx.create(ref, {
+        account: entry.account,
+        amount: entry.amount,
+        type: entry.type,
+        gameId: entry.gameId ?? null,
+        meta: entry.meta ?? null,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+      updateCpCacheInTx(tx, entry.account, entry.amount);
     });
     return true;
   } catch (e: unknown) {
@@ -207,6 +242,66 @@ export async function computeBalanceInTx(
     if (typeof a === "number") sum += a;
   });
   return sum;
+}
+
+/**
+ * O(1) spendable balance read INSIDE a transaction: reads the user's cached
+ * `cp` field (one doc get) instead of summing every ledger entry. This is the
+ * hot-path reader for spend decisions (stake affordability, the 30% cap,
+ * gauntlet stake sizing) — transaction-consistent because the cache is written
+ * transactionally by appendEntry, so within a tx the field reflects every entry
+ * committed before this read.
+ *
+ * SAFETY FALLBACK: if the `cp` field is missing (an un-migrated profile created
+ * before the cache existed, or any anomaly), we DO NOT trust a 0 — that could
+ * wrongly block or approve a spend. We fall back to the authoritative ledger
+ * sum (computeBalanceInTx) so a missing cache degrades to correct-but-slower,
+ * never to a wrong spend decision. Run repairCpCache once to backfill such
+ * users and the fast path resumes.
+ *
+ * Reads-before-writes: this is a READ, so it must precede any tx writes in the
+ * same transaction (same as the computeBalanceInTx it replaces — drop-in).
+ */
+export async function readCpInTx(
+  tx: Transaction,
+  account: string
+): Promise<number> {
+  const userRef = db.collection("users").doc(account);
+  const snap = await tx.get(userRef);
+  const v = snap.get("cp");
+  if (typeof v === "number") return v;
+  // Missing/non-numeric cache → authoritative fallback (never a wrong 0).
+  return computeBalanceInTx(tx, account);
+}
+
+/**
+ * Reconcile the cached `cp` field against the authoritative ledger sum for one
+ * user. Returns { ledger, cached, drift }. drift === 0 means the cache is
+ * honest. Use this in a periodic/admin check (or a test) to PROVE the cache
+ * never diverges from the ledger; if it ever does, the ledger wins and the
+ * cache can be overwritten with `ledger`. The ledger is always the source of
+ * truth — the cache is only a read optimization.
+ */
+export async function reconcileCp(
+  account: string
+): Promise<{ ledger: number; cached: number; drift: number }> {
+  const ledger = await computeBalance(account);
+  const snap = await db.collection("users").doc(account).get();
+  const cached = (snap.get("cp") as number) ?? 0;
+  return { ledger, cached, drift: cached - ledger };
+}
+
+/**
+ * Overwrite a user's cached `cp` with the authoritative ledger sum. The repair
+ * path if reconcileCp ever reports drift. Idempotent and safe to run anytime.
+ */
+export async function repairCpCache(account: string): Promise<number> {
+  const ledger = await computeBalance(account);
+  await db
+    .collection("users")
+    .doc(account)
+    .set({ cp: ledger }, { merge: true });
+  return ledger;
 }
 
 // ---- Faucet: starting grant -----------------------------------------------

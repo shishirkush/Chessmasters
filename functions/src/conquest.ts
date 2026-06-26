@@ -43,7 +43,7 @@ import { FieldValue } from "firebase-admin/firestore";
 import {
   appendEntry,
   computeBalance,
-  computeBalanceInTx,
+  readCpInTx,
   SINK_ACCOUNT,
 } from "./ledger";
 import { challengeStakeAmount } from "./challenge";
@@ -276,7 +276,7 @@ export const initiateBreach = functions.https.onCall(async (data, context) => {
     const challengerSnap = await tx.get(challengerRef);
     const ownerRating = (ownerSnap.get("rating") as number) ?? 1500;
     const challengerRating = (challengerSnap.get("rating") as number) ?? 1500;
-    const challengerBal = await computeBalanceInTx(tx, challengerId);
+    const challengerBal = await readCpInTx(tx, challengerId);
 
     // NOTE (design #18, revised): a challenger MAY hold multiple concurrent
     // conquests against DIFFERENT circles — the per-attacker limit was removed
@@ -546,7 +546,7 @@ async function createGauntletGameInTx(
   const defenderSnap = await tx.get(db.collection("users").doc(defenderId));
   const challengerRating = (challengerSnap.get("rating") as number) ?? 1500;
   const defenderRating = (defenderSnap.get("rating") as number) ?? 1500;
-  const defenderBal = await computeBalanceInTx(tx, defenderId);
+  const defenderBal = await readCpInTx(tx, defenderId);
 
   const normalStake = challengeStakeAmount(
     defenderRating,
@@ -961,7 +961,7 @@ export async function settleConquest(
         const challengerRating =
           (challengerSnap.get("rating") as number) ?? 1500;
         const defenderRating = (defenderSnap.get("rating") as number) ?? 1500;
-        const defenderBal = await computeBalanceInTx(tx, defenderId);
+        const defenderBal = await readCpInTx(tx, defenderId);
         const normalStake = challengeStakeAmount(
           defenderRating,
           challengerRating,

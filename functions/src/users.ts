@@ -77,6 +77,11 @@ export const onUserCreate = functions.auth.user().onCreate(async (user) => {
     wins: 0,
     losses: 0,
     draws: 0,
+    // Cached CP balance (read optimization). The ledger is the source of truth;
+    // this field is maintained transactionally by appendEntry on every CP
+    // movement. Starts at 0 here; the starting-grant ledger entry (below)
+    // increments it to STARTING_GRANT atomically.
+    cp: 0,
     // provisional = true until the player has enough games for a stable
     // rating. We flip this off later (in the rating-update step) once RD
     // drops below a threshold. For now everyone starts provisional.

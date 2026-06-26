@@ -164,11 +164,19 @@ export const onGameFinished = functions.firestore
     });
 
     // ---- Stake settlement (3c-2) ------------------------------------------
-    // If this finished game is a peer staked game, settle its stake: pay the
-    // pot (minus rake) to the winner, or return stakes (minus rake) on a draw.
-    // The stake is linked via contextId. Idempotent inside settleStakeForGame
-    // (the stake's `settled` flag), independent of rating/allotment.
-    if (after.gameType === "peer" && typeof after.contextId === "string") {
+    // If this finished game is a staked game (peer OR challenge-up), settle its
+    // stake: pay the pot (minus rake) to the winner, or return stakes (minus
+    // rake) on a draw. Both game types link the stake via contextId and lock
+    // via appendEntry, so settleStakeForGame handles both identically. It is
+    // idempotent (the stake's `settled` flag), independent of rating/allotment.
+    //
+    // NOTE: challenge_up was previously omitted here — its stakes locked at
+    // accept time but never settled, stranding CP in escrow forever (a ledger
+    // conservation bug). It uses the SAME settlement path as peer.
+    if (
+      (after.gameType === "peer" || after.gameType === "challenge_up") &&
+      typeof after.contextId === "string"
+    ) {
       try {
         await settleStakeForGame(
           context.params.gameId,

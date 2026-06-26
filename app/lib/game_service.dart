@@ -210,31 +210,20 @@ class GameService {
 
   /// Live CP balance for the current user.
   ///
-  /// CP uses a PURE LEDGER-SUM model: there is no stored balance field. The
-  /// balance is the sum of all of this user's ledger entries (grants are
-  /// positive, stakes negative, pot wins positive, etc.). We stream the user's
-  /// own ledger entries (rules allow reading only your own) and sum them
-  /// client-side, so the balance updates live as the server appends entries.
-  ///
-  /// The ledger is the single source of truth; this stream just adds it up.
+  /// Reads the denormalized `cp` field on the user's profile doc — an O(1)
+  /// read maintained transactionally by the server on every CP movement (the
+  /// ledger remains the source of truth; `cp` is a read cache). This replaces
+  /// the old approach of streaming and summing every ledger entry, which grew
+  /// unbounded with a player's history. Falls back to 0 only until the field
+  /// exists (a freshly created profile initializes cp before the grant lands).
   Stream<int> myCpBalanceStream() {
     final id = uid;
     if (id == null) return Stream<int>.value(0);
-    return _db
-        .collection('ledger')
-        .where('account', isEqualTo: id)
-        .snapshots()
-        .map((snap) {
-      var sum = 0;
-      for (final doc in snap.docs) {
-        final amount = doc.data()['amount'];
-        if (amount is int) {
-          sum += amount;
-        } else if (amount is num) {
-          sum += amount.toInt();
-        }
-      }
-      return sum;
+    return _db.collection('users').doc(id).snapshots().map((snap) {
+      final v = snap.data()?['cp'];
+      if (v is int) return v;
+      if (v is num) return v.toInt();
+      return 0;
     });
   }
 
