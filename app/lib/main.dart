@@ -1483,13 +1483,37 @@ class _ConquestNextStep extends StatelessWidget {
           );
         }
 
-        // Breach won, awaiting the owner's Gauntlet nomination.
+        // Breach won by the challenger; awaiting the owner's Gauntlet
+        // nomination. The copy must be role-aware: the challenger WON the
+        // breach, but the circle owner / breach defender LOST it and now must
+        // act — telling them "Breach won" reads as if they won. Branch on the
+        // viewer's role so each side sees the truth from their perspective.
         if (status == 'gauntlet_pending') {
+          final challengerId = q['challengerId'] as String?;
+          final ownerId = q['ownerId'] as String?;
+          final defenderId =
+              (q['breachDefenderId'] ?? q['defenderId']) as String?;
+          final String pendingMsg;
+          if (myUid != null && myUid == challengerId) {
+            // The winner of the breach.
+            pendingMsg = 'Breach won — awaiting the Gauntlet defender.';
+          } else if (myUid != null && myUid == ownerId) {
+            // The owner must nominate a Gauntlet defender.
+            pendingMsg =
+                'Your wall was breached — nominate a Gauntlet defender.';
+          } else if (myUid != null && myUid == defenderId) {
+            // The breach defender who lost (and isn't the owner).
+            pendingMsg =
+                'Your wall was breached — the Gauntlet will defend the circle.';
+          } else {
+            // Any other circle member / observer.
+            pendingMsg = 'Wall breached — awaiting a Gauntlet defender.';
+          }
           return _banner(
             scheme.tertiaryContainer,
             scheme.onTertiaryContainer,
             Icons.hourglass_top,
-            'Breach won — awaiting the Gauntlet defender.',
+            pendingMsg,
           );
         }
 
@@ -1904,13 +1928,18 @@ class CircleDetailScreen extends StatelessWidget {
                     .compareTo(b['uid'] as String? ?? '');
               });
 
-              // My own position in the ranked list. Challenge-up is only valid
-              // against players ranked ABOVE me (design §: the lower-ranked
-              // player challenges up for a rating climb). If I'm not found
-              // (shouldn't happen for a member), default to last so no Challenge
-              // buttons show.
+              // My own position in the ranked list, AND my own rating. Challenge-up
+              // is only valid against a player whose RATING is strictly higher than
+              // mine (design §: the lower-rated player challenges up for a rating
+              // climb). We gate on the actual rating comparison below — not list
+              // position — because equal-rating players can sort above me on the
+              // tiebreak (gamesPlayed/uid) yet are NOT valid challenge-up targets.
+              // If I'm not found (shouldn't happen for a member), default so no
+              // Challenge buttons show.
               final myIndex = profiles.indexWhere((p) => p['uid'] == myUid);
-              final myRank = myIndex < 0 ? profiles.length : myIndex;
+              final myRating = myIndex < 0
+                  ? double.infinity // not found → no one is "higher", hide all
+                  : ((profiles[myIndex]['rating'] ?? 1500) as num).toDouble();
 
               return Column(
                 children: [
@@ -1999,11 +2028,14 @@ class CircleDetailScreen extends StatelessWidget {
                                   child: const Text('Stake'),
                                 ),
                                 const SizedBox(width: 4),
-                                // Challenge-up only targets players ranked ABOVE
-                                // me (a shot at a rating climb against a stronger
-                                // player). i < myRank means this member outranks
-                                // me, so the button is shown; otherwise hidden.
-                                if (i < myRank)
+                                // Challenge-up only targets a player whose RATING
+                                // is strictly higher than mine (a shot at a rating
+                                // climb against a stronger player). Gate on the
+                                // actual rating, not list position, so equal-rated
+                                // members (who can sort above me on a tiebreak)
+                                // don't get an invalid Challenge button.
+                                if (((p['rating'] ?? 1500) as num).toDouble() >
+                                    myRating)
                                   OutlinedButton(
                                     style: OutlinedButton.styleFrom(
                                       padding: const EdgeInsets.symmetric(
