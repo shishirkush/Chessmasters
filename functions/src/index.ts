@@ -558,4 +558,4 @@ export {
   getBreachEligibility,
   nominateGauntletDefender,
 } from "./conquest";
-export { expireStaleItems, runExpiryNow } from "./expiry";
+export { expireStaleItems } from "./expiry";

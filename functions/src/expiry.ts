@@ -37,16 +37,10 @@ import { deleteOfferNotifications } from "./notify";
 
 /**
  * Uniform expiry window: anything still pending/waiting older than this is swept.
- *
- * ███████████████████████████████████████████████████████████████████████████
- * ██  TESTING VALUE — set to 1 MINUTE so things expire fast in the emulator. ██
- * ██  RESTORE TO 12 HOURS BEFORE COMMIT / LAUNCH:                            ██
- * ██      const EXPIRY_WINDOW_MS = 12 * 60 * 60 * 1000;                      ██
- * ██  A 1-minute window in production would expire real offers almost        ██
- * ██  instantly. DO NOT SHIP THIS VALUE.                                     ██
- * ███████████████████████████████████████████████████████████████████████████
+ * 12 hours (locked V1 design). A single window for both offers and no-show games
+ * keeps the rule simple and predictable for players ("offers last half a day").
  */
-const EXPIRY_WINDOW_MS = 60 * 1000; // TESTING: 1 min. PROD: 12 * 60 * 60 * 1000
+const EXPIRY_WINDOW_MS = 12 * 60 * 60 * 1000;
 
 /** How many docs one sweep processes per run. A safety bound so a backlog can't
  * blow up a single invocation; the next scheduled run picks up the remainder.
@@ -409,42 +403,3 @@ export const expireStaleItems = functions.pubsub
     await runAllSweeps();
     return null;
   });
-
-/**
- * ███████████████████████████████████████████████████████████████████████████
- * ██  TEST-ONLY HTTPS TRIGGER. Runs the expiry sweeps ON DEMAND so you can   ██
- * ██  validate them in the emulator without waiting for the pubsub schedule  ██
- * ██  (the emulator does not fire schedulers automatically).                 ██
- * ██                                                                         ██
- * ██  EMULATOR-ONLY GUARD: refuses to run unless FUNCTIONS_EMULATOR is set,  ██
- * ██  which the emulator sets automatically and production never does. So    ██
- * ██  this is fully functional locally (incl. calls from a LAN test device)  ██
- * ██  and INERT if it ever reaches production. Still: delete before launch.  ██
- * ███████████████████████████████████████████████████████████████████████████
- *
- * Returns the counts swept: { offers, noShows, casual }.
- */
-export const runExpiryNow = functions.https.onCall(async (_data, context) => {
-  // Read the emulator flag defensively so this compiles whether or not
-  // @types/node declares `process` globally. `process` exists at runtime in the
-  // Functions container regardless; the cast just satisfies the type checker.
-  const env =
-    (globalThis as { process?: { env?: Record<string, string | undefined> } })
-      .process?.env ?? {};
-  if (env.FUNCTIONS_EMULATOR !== "true") {
-    throw new functions.https.HttpsError(
-      "permission-denied",
-      "runExpiryNow is an emulator-only test trigger and cannot run in production."
-    );
-  }
-  // Require an authenticated caller even in the emulator (mirrors the other
-  // callables; avoids surprises if this is hit from an unauthenticated context).
-  if (!context.auth) {
-    throw new functions.https.HttpsError(
-      "unauthenticated",
-      "Sign in to run the expiry sweep."
-    );
-  }
-  const result = await runAllSweeps();
-  return { ok: true, ...result };
-});

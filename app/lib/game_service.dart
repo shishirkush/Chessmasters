@@ -371,17 +371,6 @@ class GameService {
         .call(<String, dynamic>{'stakeId': stakeId});
   }
 
-  /// TEST-ONLY: trigger the expiry sweeps on demand (the scheduled function
-  /// never fires in the emulator). The backend guards this to emulator-only.
-  /// Returns the swept counts: {ok, offers, noShows, casual, breaches}.
-  /// Remove this (and the debug button) before launch.
-  Future<Map<String, dynamic>> runExpiryNow() async {
-    final res = await _fns
-        .httpsCallable('runExpiryNow')
-        .call(<String, dynamic>{});
-    return Map<String, dynamic>.from(res.data as Map);
-  }
-
   /// Pending stake offers made TO me (I'm the opponent) — to accept/decline.
   Stream<QuerySnapshot<Map<String, dynamic>>> incomingStakesStream() {
     final id = uid;

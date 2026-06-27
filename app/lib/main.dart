@@ -4,7 +4,6 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_functions/cloud_functions.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:simple_chess_board/simple_chess_board.dart';
 
@@ -2116,39 +2115,6 @@ class CircleDetailScreen extends StatelessWidget {
                             },
                           ),
                   ),
-                  // TEST-ONLY: trigger expiry sweeps on demand (the scheduled
-                  // function never fires in the emulator). Debug builds only.
-                  // Remove before launch.
-                  if (kDebugMode)
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                      child: OutlinedButton.icon(
-                        icon: const Icon(Icons.cleaning_services_outlined),
-                        label: const Text('Run expiry sweep (debug)'),
-                        onPressed: () async {
-                          try {
-                            final r = await service.runExpiryNow();
-                            if (context.mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text(
-                                    'Swept offers: ${r['offers']}, '
-                                    'no-shows: ${r['noShows']}, '
-                                    'casual: ${r['casual']}, '
-                                    'breaches: ${r['breaches']}',
-                                  ),
-                                ),
-                              );
-                            }
-                          } on FirebaseFunctionsException catch (e) {
-                            if (context.mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                  SnackBar(content: Text(e.message ?? 'Failed')));
-                            }
-                          }
-                        },
-                      ),
-                    ),
                 ],
               );
             },
