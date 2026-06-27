@@ -551,6 +551,9 @@ export {
   declineStake,
   proposeChallengeUp,
   acceptChallengeUp,
+  postLobbySeat,
+  acceptLobbySeat,
+  cancelLobbySeat,
 } from "./stakes";
 export {
   initiateBreach,

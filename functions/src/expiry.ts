@@ -356,6 +356,45 @@ async function sweepStaleBreaches(): Promise<number> {
   return expired;
 }
 
+// ---- Sweep 5: stale open lobby seats (nothing locked → cleanup only) -------
+
+/**
+ * Open lobby seats (kind "outside", status "open") that nobody accepted within
+ * the window. A seat locks NO CP at post (Resolution C — the asymmetric stake
+ * isn't known until accepted), so this is pure cleanup: mark the seat "expired"
+ * so it stops showing in the lobby. No refund. Per-doc tx with a status re-check
+ * so a seat that gets accepted in the gap is skipped.
+ */
+async function sweepStaleLobbySeats(): Promise<number> {
+  const snap = await db
+    .collection("stakes")
+    .where("kind", "==", "outside")
+    .where("status", "==", "open")
+    .where("createdAt", "<=", cutoffTs())
+    .limit(SWEEP_BATCH_LIMIT)
+    .get();
+
+  let expired = 0;
+  for (const doc of snap.docs) {
+    try {
+      const did = await db.runTransaction(async (tx: Transaction) => {
+        const fresh = await tx.get(doc.ref);
+        const s = fresh.data();
+        if (!s || s.status !== "open") return false; // accepted/cancelled meanwhile
+        tx.update(doc.ref, {
+          status: "expired",
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        return true;
+      });
+      if (did) expired++;
+    } catch (e) {
+      console.error("[expiry] failed to expire lobby seat", doc.id, e);
+    }
+  }
+  return expired;
+}
+
 /**
  * Run all sweeps once. SHARED CORE: both the scheduled function and the
  * emulator-only test trigger call this, so testing exercises the real logic with
@@ -367,8 +406,9 @@ async function runAllSweeps(): Promise<{
   noShows: number;
   casual: number;
   breaches: number;
+  lobbySeats: number;
 }> {
-  const [offers, noShows, casual, breaches] = await Promise.all([
+  const [offers, noShows, casual, breaches, lobbySeats] = await Promise.all([
     sweepPendingOffers().catch((e) => {
       console.error("[expiry] sweepPendingOffers threw", e);
       return 0;
@@ -385,12 +425,17 @@ async function runAllSweeps(): Promise<{
       console.error("[expiry] sweepStaleBreaches threw", e);
       return 0;
     }),
+    sweepStaleLobbySeats().catch((e) => {
+      console.error("[expiry] sweepStaleLobbySeats threw", e);
+      return 0;
+    }),
   ]);
   console.log(
     `[expiry] swept: ${offers} offers, ${noShows} no-show staked games, ` +
-      `${casual} casual waiting games, ${breaches} stale breaches`
+      `${casual} casual waiting games, ${breaches} stale breaches, ` +
+      `${lobbySeats} stale lobby seats`
   );
-  return { offers, noShows, casual, breaches };
+  return { offers, noShows, casual, breaches, lobbySeats };
 }
 
 /**

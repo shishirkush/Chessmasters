@@ -1001,3 +1001,352 @@ export const acceptChallengeUp = functions.https.onCall(
     return result;
   }
 );
+
+// ===========================================================================
+// OPEN LOBBY (gameType "outside") — staked play with STRANGERS, no circle.
+// ---------------------------------------------------------------------------
+// The lobby lets any player post an OPEN SEAT that anyone else can accept,
+// outside any circle. Stakes are asymmetric by rating (same formula as
+// challenge-up): the underdog stakes less. Because the opponent is unknown at
+// post time, the asymmetric amounts CANNOT be computed or locked until someone
+// accepts — so (unlike Option-3 circle offers) a lobby seat locks NOTHING at
+// post. To keep that safe from over-posting, a player may hold only ONE open
+// seat at a time (MAX_OPEN_LOBBY_SEATS). Both legs lock at ACCEPT, with live
+// affordability checks for both players.
+//
+// V2 NOTE (deferred guardrails): smurf/collusion defenses (provisional gate,
+// rating-band limits) are intentionally NOT enforced yet. The seat doc records
+// poster rating so they can be added later without a migration. The sink (rake)
+// already makes pure CP-laundering lossy; the deferred gates would address
+// smurfing of new users. See design discussion.
+// ===========================================================================
+
+/** A player may hold at most this many open lobby seats at once (Resolution C:
+ *  the 1-seat cap is what keeps "lock nothing at post" safe from over-posting). */
+const MAX_OPEN_LOBBY_SEATS = 1;
+
+/**
+ * Post an open lobby seat. Locks NOTHING (the asymmetric stake isn't known
+ * until someone accepts). Enforces the one-open-seat cap and a minimum-balance
+ * sanity check (you must at least be able to cover MIN_STAKE — the real, larger
+ * amount is checked at accept against the actual rating gap).
+ */
+export const postLobbySeat = functions.https.onCall(async (data, context) => {
+  const uid = requireAuth(context);
+
+  // One open seat per player (Resolution C). Authoritative check is in the tx;
+  // this is a fast early error.
+  const existing = await db
+    .collection("stakes")
+    .where("issuerId", "==", uid)
+    .where("kind", "==", "outside")
+    .where("status", "==", "open")
+    .limit(MAX_OPEN_LOBBY_SEATS)
+    .get();
+  if (existing.size >= MAX_OPEN_LOBBY_SEATS) {
+    throw new functions.https.HttpsError(
+      "resource-exhausted",
+      "You already have an open lobby seat. Cancel it before posting another."
+    );
+  }
+
+  const seatRef = db.collection("stakes").doc();
+  await db.runTransaction(async (tx) => {
+    // Sanity: must be able to cover at least the minimum stake. (The real
+    // asymmetric amount is computed and checked when someone accepts.)
+    const bal = await readCpInTx(tx, uid);
+    if (bal < MIN_STAKE) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        `You need at least ${MIN_STAKE} CP to post a lobby seat.`
+      );
+    }
+
+    // Re-check the one-seat cap inside the tx (race-safe).
+    const open = await tx.get(
+      db
+        .collection("stakes")
+        .where("issuerId", "==", uid)
+        .where("kind", "==", "outside")
+        .where("status", "==", "open")
+    );
+    if (open.size >= MAX_OPEN_LOBBY_SEATS) {
+      throw new functions.https.HttpsError(
+        "resource-exhausted",
+        "You already have an open lobby seat."
+      );
+    }
+
+    // Snapshot the poster's rating for display + future rating-band guardrails.
+    const profile = await tx.get(db.collection("users").doc(uid));
+    const posterRating = (profile.get("rating") as number) ?? 1500;
+
+    tx.set(seatRef, {
+      kind: "outside", // open lobby / stranger game
+      issuerId: uid, // the poster (seat owner)
+      opponentId: null, // unknown until accepted
+      circleId: null, // circle-less
+      status: "open", // open seat (distinct from "pending" directed offers)
+      issuerLocked: false, // NOTHING locked at post (Resolution C)
+      gameId: null,
+      pot: null,
+      settledResult: null,
+      settled: false,
+      posterRating, // for the lobby list + V2 rating-band checks
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+  });
+
+  return { seatId: seatRef.id };
+});
+
+/**
+ * Accept an open lobby seat. This is where the real work happens: compute both
+ * players' asymmetric stakes from the live rating gap (same formula as
+ * challenge-up), check BOTH can afford their leg (live balance + 40% cap), lock
+ * BOTH legs now, create the "outside" game, and mark the seat matched.
+ */
+export const acceptLobbySeat = functions.https.onCall(async (data, context) => {
+  const uid = requireAuth(context);
+  const seatId: string | undefined = data?.seatId;
+  if (!seatId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "seatId is required."
+    );
+  }
+
+  const seatRef = db.collection("stakes").doc(seatId);
+
+  const result = await db.runTransaction(async (tx) => {
+    // ---- READS ----
+    const snap = await tx.get(seatRef);
+    if (!snap.exists) {
+      throw new functions.https.HttpsError("not-found", "Seat not found.");
+    }
+    const s = snap.data()!;
+    if (s.kind !== "outside") {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Not a lobby seat."
+      );
+    }
+    if (s.status !== "open") {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "This seat is no longer open."
+      );
+    }
+    const posterId: string = s.issuerId;
+    if (posterId === uid) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "You can't accept your own seat."
+      );
+    }
+
+    // Live ratings (for the asymmetric formula) and balances (for the cap).
+    const posterProfile = await tx.get(db.collection("users").doc(posterId));
+    const accepterProfile = await tx.get(db.collection("users").doc(uid));
+    const posterRating = (posterProfile.get("rating") as number) ?? 1500;
+    const accepterRating = (accepterProfile.get("rating") as number) ?? 1500;
+
+    const posterBal = await readCpInTx(tx, posterId);
+    const accepterBal = await readCpInTx(tx, uid);
+
+    // Same-opponent daily cap (both directions) — reuses the existing anti-
+    // collusion limiter. (V2 will add stronger lobby-specific guardrails.)
+    const posterCounts = await getCountsInTx(tx, posterId);
+    const accepterCounts = await getCountsInTx(tx, uid);
+    if (
+      (posterCounts.opponentCounts[uid] || 0) >= SAME_OPPONENT_DAILY_CAP ||
+      (accepterCounts.opponentCounts[posterId] || 0) >= SAME_OPPONENT_DAILY_CAP
+    ) {
+      throw new functions.https.HttpsError(
+        "resource-exhausted",
+        `Daily limit reached against this opponent (${SAME_OPPONENT_DAILY_CAP}/day).`
+      );
+    }
+
+    // Asymmetric stakes: each stakes their OWN challenge-up fraction vs the
+    // other's rating, against their OWN balance. Underdog (lower rating) stakes
+    // the larger fraction. Computed NOW (at accept) since the opponent is known.
+    const posterStake = challengeStakeAmount(
+      posterRating,
+      accepterRating,
+      posterBal
+    );
+    const accepterStake = challengeStakeAmount(
+      accepterRating,
+      posterRating,
+      accepterBal
+    );
+
+    if (posterStake < MIN_STAKE || accepterStake < MIN_STAKE) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        `Both stakes must be at least ${MIN_STAKE} CP.`
+      );
+    }
+    // BOTH legs lock here, so BOTH must be able to afford their stake now.
+    if (posterBal < posterStake) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "The seat poster no longer has enough CP — seat can't be filled."
+      );
+    }
+    if (accepterBal < accepterStake) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "You don't have enough CP for this game."
+      );
+    }
+    if (posterStake > Math.floor(posterBal * MAX_STAKE_FRACTION)) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Stake exceeds the poster's per-game limit — seat can't be filled."
+      );
+    }
+    if (accepterStake > Math.floor(accepterBal * MAX_STAKE_FRACTION)) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        `Stake exceeds ${Math.round(MAX_STAKE_FRACTION * 100)}% of your balance.`
+      );
+    }
+
+    // ---- WRITES ----
+    const posterIsWhite = Math.random() < 0.5;
+    const whiteId = posterIsWhite ? posterId : uid;
+    const blackId = posterIsWhite ? uid : posterId;
+
+    const gameRef = db.collection("games").doc();
+    tx.set(gameRef, {
+      status: "waiting",
+      gameType: "outside",
+      contextId: seatId,
+      fen: STARTING_FEN,
+      moves: [],
+      turn: "w",
+      whiteId,
+      blackId,
+      players: [whiteId, blackId],
+      ready: [],
+      whiteMs: INITIAL_MS,
+      blackMs: INITIAL_MS,
+      lastMoveAt: null,
+      result: null,
+      resultReason: null,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    // BOTH legs lock now (nothing was locked at post — Resolution C).
+    appendEntry(tx, {
+      account: posterId,
+      amount: -posterStake,
+      type: "stake_lock",
+      gameId: gameRef.id,
+      meta: { stakeId: seatId, kind: "outside", leg: "poster" },
+    });
+    appendEntry(tx, {
+      account: uid,
+      amount: -accepterStake,
+      type: "stake_lock",
+      gameId: gameRef.id,
+      meta: { stakeId: seatId, kind: "outside", leg: "accepter" },
+    });
+
+    tx.update(seatRef, {
+      status: "locked",
+      opponentId: uid, // the accepter
+      issuerStake: posterStake, // poster's leg (issuer == poster)
+      opponentStake: accepterStake, // accepter's leg
+      pot: posterStake + accepterStake,
+      gameId: gameRef.id,
+      whiteId,
+      blackId,
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    // Same-opponent counters for both.
+    bumpOpponent(tx, posterId, uid);
+    bumpOpponent(tx, uid, posterId);
+
+    // Notify the poster their seat was filled; both that the game is ready.
+    notifyTx(tx, {
+      recipientId: posterId,
+      type: "stake_accepted",
+      title: "Your seat was filled",
+      body: "Someone joined your open game. Enter to start.",
+      data: { stakeId: seatId, gameId: gameRef.id },
+    });
+    notifyTx(tx, {
+      recipientId: posterId,
+      type: "game_ready",
+      title: "Game ready to start",
+      body: "Enter the board to start your game.",
+      data: { gameId: gameRef.id },
+    });
+    notifyTx(tx, {
+      recipientId: uid,
+      type: "game_ready",
+      title: "Game ready to start",
+      body: "Enter the board to start your game.",
+      data: { gameId: gameRef.id },
+    });
+
+    return { gameId: gameRef.id, posterStake, accepterStake };
+  });
+
+  return result;
+});
+
+/**
+ * Cancel (withdraw) your own open lobby seat. Nothing was locked at post, so
+ * there's nothing to refund — just mark it cancelled.
+ */
+export const cancelLobbySeat = functions.https.onCall(async (data, context) => {
+  const uid = requireAuth(context);
+  const seatId: string | undefined = data?.seatId;
+  if (!seatId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "seatId is required."
+    );
+  }
+
+  const seatRef = db.collection("stakes").doc(seatId);
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(seatRef);
+    if (!snap.exists) {
+      throw new functions.https.HttpsError("not-found", "Seat not found.");
+    }
+    const s = snap.data()!;
+    if (s.kind !== "outside") {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Not a lobby seat."
+      );
+    }
+    if (s.issuerId !== uid) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "Only the seat owner can cancel it."
+      );
+    }
+    if (s.status !== "open") {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Only an open seat can be cancelled."
+      );
+    }
+    // Nothing locked at post → no refund. Just close the seat.
+    tx.update(seatRef, {
+      status: "cancelled",
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+  });
+
+  return { ok: true };
+});
