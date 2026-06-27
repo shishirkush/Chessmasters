@@ -37,7 +37,6 @@ import { FieldValue } from "firebase-admin/firestore";
 import {
   appendEntry,
   readCpInTx,
-  computeBalance,
   settlePot,
   SINK_ACCOUNT,
   MIN_STAKE,
@@ -56,6 +55,14 @@ import { notify, notifyTx, deleteOfferNotifications } from "./notify";
 // Game constants — must match the engine's fresh-game shape (index.ts).
 const STARTING_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 const INITIAL_MS = 5 * 60 * 1000; // 5+3 blitz, same as casual games
+
+/**
+ * Cap on how many pending offers (stakes + challenge-ups) one issuer can have
+ * open at once. With issuer-locking (Option 3) exposure is already self-limiting
+ * — each open offer locks CP, so you can't promise more than you hold — but a cap
+ * still bounds doc/query growth and keeps one player from spamming the system.
+ */
+const MAX_OPEN_OFFERS = 10;
 
 function requireAuth(context: functions.https.CallableContext): string {
   if (!context.auth) {
@@ -116,7 +123,8 @@ export const proposeStake = functions.https.onCall(async (data, context) => {
   }
 
   // One pending proposal per (issuer, opponent) pair in this circle — avoid
-  // duplicate offers stacking up.
+  // duplicate offers stacking up. (Cheap pre-check outside the tx for a clear
+  // early error; the authoritative dupe + count guard runs in the tx below.)
   const dupe = await db
     .collection("stakes")
     .where("circleId", "==", circleId)
@@ -132,34 +140,80 @@ export const proposeStake = functions.https.onCall(async (data, context) => {
     );
   }
 
-  // Pre-validate the §5 cap against the ISSUER's current balance, so an
-  // over-cap offer is rejected at PROPOSE time with a clear message — rather
-  // than sailing through and failing only when the opponent tries to accept.
-  // (The authoritative cap check against BOTH balances still runs at accept,
-  // since the opponent's balance can change in between.)
-  const issuerBalance = await computeBalance(issuerId);
-  const issuerCap = Math.floor(issuerBalance * MAX_STAKE_FRACTION);
-  if (amount > issuerCap) {
-    throw new functions.https.HttpsError(
-      "failed-precondition",
-      `Stake exceeds 30% of your balance. Your current max is ${issuerCap} CP.`
-    );
-  }
+  // OPTION 3 — lock the issuer's CP at PROPOSE time (not accept). This makes
+  // offered CP genuinely reserved: a player can never have more pending offers
+  // than they can afford, and an accepted offer can't bounce on the issuer's
+  // balance. The opponent's leg still locks at ACCEPT (they haven't consented
+  // yet and may not have the CP). Refund paths: cancel / decline / expire.
+  //
+  // The whole thing must be ONE transaction: read the issuer's escrow-netted
+  // balance, enforce the 30% cap and the open-offer cap, then lock + create
+  // atomically — otherwise two concurrent proposes could both read the same
+  // balance and over-lock.
+  const stakeRef = db.collection("stakes").doc();
+  await db.runTransaction(async (tx) => {
+    // Live, escrow-netted balance (already reflects any CP locked by other open
+    // offers / games). This is what makes over-promising structurally impossible.
+    const issuerBal = await readCpInTx(tx, issuerId);
 
-  const ref = db.collection("stakes").doc();
-  await ref.set({
-    issuerId,
-    opponentId,
-    circleId,
-    amount, // the proposed absolute CP each side will stake
-    status: "pending",
-    gameId: null,
-    pot: null,
-    settledResult: null,
-    settled: false,
-    createdAt: FieldValue.serverTimestamp(),
-    updatedAt: FieldValue.serverTimestamp(),
+    // 30% cap against the CURRENT spendable balance.
+    const issuerCap = Math.floor(issuerBal * MAX_STAKE_FRACTION);
+    if (amount > issuerCap) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        `Stake exceeds 30% of your spendable balance. Your current max is ${issuerCap} CP.`
+      );
+    }
+    // Affordability (redundant given the 30% cap for amount>0, but explicit).
+    if (issuerBal < amount) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "You don't have enough spendable CP for this stake."
+      );
+    }
+
+    // Open-offer cap: count this issuer's current pending offers in `stakes`.
+    const openSnap = await tx.get(
+      db
+        .collection("stakes")
+        .where("issuerId", "==", issuerId)
+        .where("status", "==", "pending")
+    );
+    if (openSnap.size >= MAX_OPEN_OFFERS) {
+      throw new functions.https.HttpsError(
+        "resource-exhausted",
+        `You can have at most ${MAX_OPEN_OFFERS} open offers at once. ` +
+          `Resolve some before making more.`
+      );
+    }
+
+    // Lock the issuer's leg now — a negative ledger entry (cp cache decrements
+    // through the appendEntry chokepoint, so spendable balance drops immediately).
+    appendEntry(tx, {
+      account: issuerId,
+      amount: -amount,
+      type: "stake_lock",
+      meta: { stakeId: stakeRef.id, kind: "offer", leg: "issuer" },
+    });
+
+    // Create the offer, recording that the issuer's leg is locked. The opponent
+    // leg locks at accept.
+    tx.set(stakeRef, {
+      issuerId,
+      opponentId,
+      circleId,
+      amount, // the proposed absolute CP each side will stake
+      status: "pending",
+      issuerLocked: true, // OPTION 3: issuer's CP is held in escrow now
+      gameId: null,
+      pot: null,
+      settledResult: null,
+      settled: false,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
   });
+  const ref = stakeRef;
 
   // Notify the opponent that they have a stake offer to accept/decline.
   await notify({
@@ -203,8 +257,24 @@ export const cancelStake = functions.https.onCall(async (data, context) => {
         "Only a pending offer can be cancelled."
       );
     }
+    // OPTION 3: refund the issuer's escrowed leg (locked at propose). The
+    // locked amount differs by kind: peer stakes use `amount`; challenge-up
+    // offers use the fixed `issuerStake`. Use whichever this offer carries.
+    if (s.issuerLocked === true) {
+      const issuerLeg: number =
+        typeof s.issuerStake === "number" ? s.issuerStake : s.amount;
+      if (typeof issuerLeg === "number" && issuerLeg > 0) {
+        appendEntry(tx, {
+          account: s.issuerId,
+          amount: issuerLeg,
+          type: "stake_return",
+          meta: { stakeId, outcome: "offer_cancelled", leg: "issuer" },
+        });
+      }
+    }
     tx.update(ref, {
       status: "cancelled",
+      issuerLocked: false,
       updatedAt: FieldValue.serverTimestamp(),
     });
   });
@@ -241,8 +311,23 @@ export const declineStake = functions.https.onCall(async (data, context) => {
         "Only a pending offer can be declined."
       );
     }
+    // OPTION 3: the opponent declined → refund the issuer's escrowed leg.
+    // Peer stakes carry `amount`; challenge-up offers carry `issuerStake`.
+    if (s.issuerLocked === true) {
+      const issuerLeg: number =
+        typeof s.issuerStake === "number" ? s.issuerStake : s.amount;
+      if (typeof issuerLeg === "number" && issuerLeg > 0) {
+        appendEntry(tx, {
+          account: s.issuerId,
+          amount: issuerLeg,
+          type: "stake_return",
+          meta: { stakeId, outcome: "offer_declined", leg: "issuer" },
+        });
+      }
+    }
     tx.update(ref, {
       status: "declined",
+      issuerLocked: false,
       updatedAt: FieldValue.serverTimestamp(),
     });
   });
@@ -293,8 +378,18 @@ export const acceptStake = functions.https.onCall(async (data, context) => {
     const opponentId: string = s.opponentId;
     const amount: number = s.amount;
 
-    // Live, transaction-consistent spendable balances (escrow already netted).
-    const issuerBal = await readCpInTx(tx, issuerId);
+    // OPTION 3: the issuer's leg was locked at PROPOSE time. Here we only need
+    // to validate and lock the OPPONENT's leg. (Guard against an offer that
+    // somehow lacks the issuer lock — pre-Option-3 data — so we never create a
+    // half-funded game.)
+    if (s.issuerLocked !== true) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "This offer is missing its issuer escrow and can't be accepted."
+      );
+    }
+
+    // Live, transaction-consistent spendable balance for the OPPONENT.
     const opponentBal = await readCpInTx(tx, opponentId);
 
     // Anti-collusion cap: ≤3 games/day vs the same opponent (any game type).
@@ -308,23 +403,11 @@ export const acceptStake = functions.https.onCall(async (data, context) => {
       );
     }
 
-    // Validate the §5 cap against BOTH players' current balances.
-    if (issuerBal < amount) {
-      throw new functions.https.HttpsError(
-        "failed-precondition",
-        "The issuer no longer has enough CP for this stake."
-      );
-    }
+    // Validate the §5 cap against the OPPONENT's current balance only.
     if (opponentBal < amount) {
       throw new functions.https.HttpsError(
         "failed-precondition",
         "You don't have enough CP for this stake."
-      );
-    }
-    if (amount > Math.floor(issuerBal * MAX_STAKE_FRACTION)) {
-      throw new functions.https.HttpsError(
-        "failed-precondition",
-        "Stake exceeds 30% of the issuer's balance."
       );
     }
     if (amount > Math.floor(opponentBal * MAX_STAKE_FRACTION)) {
@@ -366,20 +449,16 @@ export const acceptStake = functions.https.onCall(async (data, context) => {
       updatedAt: FieldValue.serverTimestamp(),
     });
 
-    // Lock both stakes — negative ledger entries. CP leaves spendable now.
-    appendEntry(tx, {
-      account: issuerId,
-      amount: -amount,
-      type: "stake_lock",
-      gameId: gameRef.id,
-      meta: { stakeId },
-    });
+    // Lock the OPPONENT's stake — negative ledger entry. The ISSUER's leg is
+    // already locked (from propose), so we don't lock it again here; doing so
+    // would double-charge the issuer. The offer's escrow `meta.kind:"offer"`
+    // issuer lock now becomes part of this game's pot.
     appendEntry(tx, {
       account: opponentId,
       amount: -amount,
       type: "stake_lock",
       gameId: gameRef.id,
-      meta: { stakeId },
+      meta: { stakeId, leg: "opponent" },
     });
 
     // Flip the stake to locked, record the resolved amounts + game link.
@@ -633,20 +712,91 @@ export const proposeChallengeUp = functions.https.onCall(
       );
     }
 
-    const ref = db.collection("stakes").doc();
-    await ref.set({
-      kind: "challenge_up", // distinguishes from peer stakes
-      issuerId,
-      opponentId,
-      circleId, // the circle it was issued from (for the accept deep-link)
-      status: "pending",
-      gameId: null,
-      pot: null,
-      settledResult: null,
-      settled: false,
-      createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
+    // OPTION 3 for challenge-up: COMPUTE & FIX both asymmetric stakes NOW (at
+    // propose) from the current rating gap + balances, then LOCK the issuer's
+    // fixed leg. The opponent sees concrete terms and accepts/declines; their
+    // leg locks at accept. This makes challenge-up over-subscription impossible
+    // (each open challenge reserves real CP) and gives the opponent an honest,
+    // concrete offer instead of "accept to discover the stakes". If ratings
+    // drift before accept, the FIXED terms stand — it's an offer, not a live
+    // quote. All in ONE transaction so concurrent proposes can't over-lock.
+    const stakeRef = db.collection("stakes").doc();
+    await db.runTransaction(async (tx) => {
+      const issuerBal = await readCpInTx(tx, issuerId);
+      // Opponent's balance feeds the formula for THEIR fixed leg (the favorite's
+      // smaller fraction). Read it here at propose so both terms are fixed now.
+      const opponentBal = await readCpInTx(tx, opponentId);
+
+      // Compute both legs against propose-time ratings/balances and FIX them.
+      const issuerStake = challengeStakeAmount(
+        issuerRating,
+        opponentRating,
+        issuerBal
+      );
+      const opponentStake = challengeStakeAmount(
+        opponentRating,
+        issuerRating,
+        opponentBal
+      );
+      if (issuerStake < MIN_STAKE || opponentStake < MIN_STAKE) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          `Both stakes must be at least ${MIN_STAKE} CP.`
+        );
+      }
+      // The issuer must be able to cover their fixed leg right now.
+      if (issuerBal < issuerStake) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "You don't have enough spendable CP to back this challenge."
+        );
+      }
+
+      // Open-offer cap spans BOTH peer + challenge-up pending offers.
+      const openSnap = await tx.get(
+        db
+          .collection("stakes")
+          .where("issuerId", "==", issuerId)
+          .where("status", "==", "pending")
+      );
+      if (openSnap.size >= MAX_OPEN_OFFERS) {
+        throw new functions.https.HttpsError(
+          "resource-exhausted",
+          `You can have at most ${MAX_OPEN_OFFERS} open offers at once. ` +
+            `Resolve some before making more.`
+        );
+      }
+
+      // Lock the issuer's fixed leg now.
+      appendEntry(tx, {
+        account: issuerId,
+        amount: -issuerStake,
+        type: "stake_lock",
+        meta: { stakeId: stakeRef.id, kind: "offer", leg: "issuer" },
+      });
+
+      tx.set(stakeRef, {
+        kind: "challenge_up", // distinguishes from peer stakes
+        issuerId,
+        opponentId,
+        circleId, // the circle it was issued from (for the accept deep-link)
+        status: "pending",
+        issuerLocked: true, // OPTION 3: issuer's CP is held in escrow now
+        // FIXED asymmetric terms, computed at propose:
+        issuerStake,
+        opponentStake,
+        // Snapshot the ratings the terms were computed from (audit/debug).
+        proposeIssuerRating: issuerRating,
+        proposeOpponentRating: opponentRating,
+        gameId: null,
+        pot: null,
+        settledResult: null,
+        settled: false,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
     });
+    const ref = stakeRef;
 
     // Notify the opponent of the challenge so they can accept within the window.
     await notify({
@@ -714,19 +864,24 @@ export const acceptChallengeUp = functions.https.onCall(
       const issuerId: string = s.issuerId;
       const opponentId: string = s.opponentId;
 
-      // Live ratings (for the formula) and balances (for the cap).
-      const issuerProfileSnap = await tx.get(
-        db.collection("users").doc(issuerId)
-      );
-      const opponentProfileSnap = await tx.get(
-        db.collection("users").doc(opponentId)
-      );
-      const issuerRating =
-        (issuerProfileSnap.get("rating") as number) ?? 1500;
-      const opponentRating =
-        (opponentProfileSnap.get("rating") as number) ?? 1500;
+      // OPTION 3: the asymmetric stakes were COMPUTED & FIXED at propose, and
+      // the issuer's leg is already locked. We honor those fixed terms here
+      // (we do NOT recompute against live ratings — the offer is a fixed deal).
+      // Guard against a pre-Option-3 offer that lacks fixed terms / issuer lock.
+      if (
+        s.issuerLocked !== true ||
+        typeof s.issuerStake !== "number" ||
+        typeof s.opponentStake !== "number"
+      ) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "This challenge is missing its fixed terms and can't be accepted."
+        );
+      }
+      const issuerStake: number = s.issuerStake;
+      const opponentStake: number = s.opponentStake;
 
-      const issuerBal = await readCpInTx(tx, issuerId);
+      // Only the OPPONENT's balance needs validating now (issuer is escrowed).
       const opponentBal = await readCpInTx(tx, opponentId);
 
       // Same-opponent daily cap (both directions).
@@ -744,31 +899,10 @@ export const acceptChallengeUp = functions.https.onCall(
         );
       }
 
-      // Asymmetric stakes: each stakes their OWN challenge-up fraction, vs the
-      // other's rating, against their OWN balance. Underdog (lower rating)
-      // → larger fraction; favorite → smaller. (CP = the entry fee for the
-      // rating shot.)
-      const issuerStake = challengeStakeAmount(
-        issuerRating,
-        opponentRating,
-        issuerBal
-      );
-      const opponentStake = challengeStakeAmount(
-        opponentRating,
-        issuerRating,
-        opponentBal
-      );
-
       if (issuerStake < MIN_STAKE || opponentStake < MIN_STAKE) {
         throw new functions.https.HttpsError(
           "failed-precondition",
           `Both stakes must be at least ${MIN_STAKE} CP.`
-        );
-      }
-      if (issuerBal < issuerStake) {
-        throw new functions.https.HttpsError(
-          "failed-precondition",
-          "The challenger no longer has enough CP."
         );
       }
       if (opponentBal < opponentStake) {
@@ -804,20 +938,14 @@ export const acceptChallengeUp = functions.https.onCall(
         updatedAt: FieldValue.serverTimestamp(),
       });
 
-      // Asymmetric escrow locks.
-      appendEntry(tx, {
-        account: issuerId,
-        amount: -issuerStake,
-        type: "stake_lock",
-        gameId: gameRef.id,
-        meta: { stakeId, kind: "challenge_up" },
-      });
+      // Lock ONLY the opponent's leg — the issuer's was locked at propose.
+      // Locking the issuer again here would double-charge them.
       appendEntry(tx, {
         account: opponentId,
         amount: -opponentStake,
         type: "stake_lock",
         gameId: gameRef.id,
-        meta: { stakeId, kind: "challenge_up" },
+        meta: { stakeId, kind: "challenge_up", leg: "opponent" },
       });
 
       tx.update(stakeRef, {
