@@ -4,6 +4,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_functions/cloud_functions.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:simple_chess_board/simple_chess_board.dart';
 
@@ -2068,6 +2069,8 @@ class CircleDetailScreen extends StatelessWidget {
                     ),
                   // Stake offers made to me (any member) — accept/decline.
                   _IncomingStakes(service: service),
+                  // My own pending offers — cancel (refunds escrowed CP).
+                  _OutgoingStakes(service: service),
                   const Divider(height: 1),
                   Padding(
                     padding: const EdgeInsets.all(16),
@@ -2113,6 +2116,39 @@ class CircleDetailScreen extends StatelessWidget {
                             },
                           ),
                   ),
+                  // TEST-ONLY: trigger expiry sweeps on demand (the scheduled
+                  // function never fires in the emulator). Debug builds only.
+                  // Remove before launch.
+                  if (kDebugMode)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                      child: OutlinedButton.icon(
+                        icon: const Icon(Icons.cleaning_services_outlined),
+                        label: const Text('Run expiry sweep (debug)'),
+                        onPressed: () async {
+                          try {
+                            final r = await service.runExpiryNow();
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    'Swept offers: ${r['offers']}, '
+                                    'no-shows: ${r['noShows']}, '
+                                    'casual: ${r['casual']}, '
+                                    'breaches: ${r['breaches']}',
+                                  ),
+                                ),
+                              );
+                            }
+                          } on FirebaseFunctionsException catch (e) {
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(content: Text(e.message ?? 'Failed')));
+                            }
+                          }
+                        },
+                      ),
+                    ),
                 ],
               );
             },
@@ -3263,6 +3299,78 @@ class _IncomingStakes extends StatelessWidget {
                       },
                     ),
                   ],
+                ),
+              );
+            }),
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// The issuer's view of their OWN pending offers (peer stakes + challenge-ups),
+/// each with a Cancel button. Cancelling retracts the offer and refunds the
+/// issuer's escrowed CP (locked at propose under the Option 3 model), via the
+/// `cancelStake` callable. Only PENDING offers appear here — once an offer is
+/// accepted it becomes a game (no cancel; play or resign), and breaches are
+/// uncancellable by design (they resolve by play or by expiry).
+class _OutgoingStakes extends StatelessWidget {
+  final GameService service;
+  const _OutgoingStakes({required this.service});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: service.outgoingStakesStream(),
+      builder: (context, snap) {
+        final docs = snap.data?.docs ?? [];
+        if (docs.isEmpty) return const SizedBox.shrink();
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+              child: Text('Your open offers (${docs.length})',
+                  style: const TextStyle(
+                      fontWeight: FontWeight.bold, color: Colors.indigo)),
+            ),
+            ...docs.map((d) {
+              final s = d.data();
+              final stakeId = d.id;
+              final isChallenge = s['kind'] == 'challenge_up';
+              // Peer offers carry `amount`; challenge-ups carry the fixed
+              // `issuerStake` (the CP you've escrowed for this challenge).
+              final locked = isChallenge
+                  ? (s['issuerStake'] ?? 0) as int
+                  : (s['amount'] ?? 0) as int;
+              return ListTile(
+                dense: true,
+                leading: Icon(
+                  isChallenge ? Icons.bolt : Icons.toll,
+                  color: isChallenge ? Colors.deepOrange : Colors.indigo,
+                ),
+                title: Text(isChallenge ? 'Challenge-up' : 'Stake $locked CP'),
+                subtitle: Text(
+                    'Awaiting response · $locked CP held — cancel to refund'),
+                trailing: TextButton.icon(
+                  icon: const Icon(Icons.undo, size: 18),
+                  label: const Text('Cancel'),
+                  onPressed: () async {
+                    try {
+                      await service.cancelStake(stakeId);
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                            content: Text('Offer cancelled — CP refunded.')));
+                      }
+                    } on FirebaseFunctionsException catch (e) {
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text(e.message ?? 'Failed')));
+                      }
+                    }
+                  },
                 ),
               );
             }),
