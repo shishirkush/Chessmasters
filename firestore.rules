@@ -161,5 +161,22 @@ service cloud.firestore {
     match /gameCounts/{docId} {
       allow read, write: if false;
     }
+
+    // EXPLICIT TERMINAL DENY (defense-in-depth / future-proofing).
+    // Firestore already denies any path that matches no rule, so this is not
+    // strictly required today. It exists to make that intent EXPLICIT and to
+    // guard against future drift: if a new collection is added and someone
+    // forgets to write a rule for it, this ensures it stays locked rather than
+    // relying on the implicit default. It does NOT loosen anything above —
+    // rules are OR'd, so the specific `allow` rules for the collections above
+    // still grant their scoped access; this only governs unmatched paths.
+    //
+    // RULE OF THUMB for any collection added later: if a Cloud Function writes
+    // it, clients should be read-scoped and write-denied (write: if false).
+    // Add an explicit `match` for it above — do not rely on this catch-all to
+    // grant access, only to deny it.
+    match /{document=**} {
+      allow read, write: if false;
+    }
   }
 }
