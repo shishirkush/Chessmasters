@@ -6,7 +6,7 @@
  *   - The issuer proposes an ABSOLUTE CP amount; the opponent accepts or
  *     declines. (Equal fixed CP from both — symmetric pot.)
  *   - At ACCEPT (not propose) we validate against LIVE balances: each player
- *     must hold the stake AND the stake must be ≤ 30% of each player's balance
+ *     must hold the stake AND the stake must be ≤ 40% of each player's balance
  *     (the §5 hard cap, computed on current balance so it scales down as you
  *     lose).
  *   - Accepting LOCKS both stakes into escrow ATOMICALLY and creates an active
@@ -147,7 +147,7 @@ export const proposeStake = functions.https.onCall(async (data, context) => {
   // yet and may not have the CP). Refund paths: cancel / decline / expire.
   //
   // The whole thing must be ONE transaction: read the issuer's escrow-netted
-  // balance, enforce the 30% cap and the open-offer cap, then lock + create
+  // balance, enforce the 40% cap and the open-offer cap, then lock + create
   // atomically — otherwise two concurrent proposes could both read the same
   // balance and over-lock.
   const stakeRef = db.collection("stakes").doc();
@@ -156,15 +156,15 @@ export const proposeStake = functions.https.onCall(async (data, context) => {
     // offers / games). This is what makes over-promising structurally impossible.
     const issuerBal = await readCpInTx(tx, issuerId);
 
-    // 30% cap against the CURRENT spendable balance.
+    // 40% cap against the CURRENT spendable balance.
     const issuerCap = Math.floor(issuerBal * MAX_STAKE_FRACTION);
     if (amount > issuerCap) {
       throw new functions.https.HttpsError(
         "failed-precondition",
-        `Stake exceeds 30% of your spendable balance. Your current max is ${issuerCap} CP.`
+        `Stake exceeds ${Math.round(MAX_STAKE_FRACTION * 100)}% of your spendable balance. Your current max is ${issuerCap} CP.`
       );
     }
-    // Affordability (redundant given the 30% cap for amount>0, but explicit).
+    // Affordability (redundant given the cap for amount>0, but explicit).
     if (issuerBal < amount) {
       throw new functions.https.HttpsError(
         "failed-precondition",
@@ -339,7 +339,7 @@ export const declineStake = functions.https.onCall(async (data, context) => {
 // ---- acceptStake (THE critical transaction) -------------------------------
 /**
  * Opponent accepts. In ONE transaction: validate both live balances against
- * the 30% cap, lock both stakes (negative ledger entries), create an ACTIVE
+ * the 40% cap, lock both stakes (negative ledger entries), create an ACTIVE
  * game wired to the engine, and flip the stake to "locked". All-or-nothing.
  */
 export const acceptStake = functions.https.onCall(async (data, context) => {
@@ -413,7 +413,7 @@ export const acceptStake = functions.https.onCall(async (data, context) => {
     if (amount > Math.floor(opponentBal * MAX_STAKE_FRACTION)) {
       throw new functions.https.HttpsError(
         "failed-precondition",
-        "Stake exceeds 30% of your balance."
+        `Stake exceeds ${Math.round(MAX_STAKE_FRACTION * 100)}% of your balance.`
       );
     }
 
@@ -817,7 +817,7 @@ export const proposeChallengeUp = functions.https.onCall(
 
 /**
  * Accept a challenge-up. Computes BOTH players' asymmetric stakes from the
- * live rating gap and balances, validates each against the 30% cap and the
+ * live rating gap and balances, validates each against the 40% cap and the
  * same-opponent daily cap, locks both (asymmetric escrow), creates the active
  * "challenge_up" game, and links it. All atomic — same guarantees as peer
  * accept, just with asymmetric amounts.
