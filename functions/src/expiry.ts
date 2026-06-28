@@ -42,6 +42,19 @@ import { deleteOfferNotifications } from "./notify";
  */
 const EXPIRY_WINDOW_MS = 12 * 60 * 60 * 1000;
 
+/**
+ * SEPARATE, SHORTER window for OPEN LOBBY SEATS. A public lobby seat is unlike a
+ * directed offer: if nobody grabs it within a short window the poster has almost
+ * certainly moved on, and a lobby full of hours-old seats is bad UX (people tap
+ * Join on seats whose poster is long gone). 30 minutes keeps the lobby fresh.
+ * Lobby seats lock no CP, so a short window costs the poster nothing.
+ *
+ * ── TESTING: to watch a seat expire without waiting 30 min, temporarily set
+ *    this to e.g. 60 * 1000 (1 min), rebuild, and run the sweep. RESTORE to
+ *    30 * 60 * 1000 before launch. ──
+ */
+const LOBBY_SEAT_WINDOW_MS = 30 * 60 * 1000;
+
 /** How many docs one sweep processes per run. A safety bound so a backlog can't
  * blow up a single invocation; the next scheduled run picks up the remainder.
  */
@@ -50,6 +63,11 @@ const SWEEP_BATCH_LIMIT = 200;
 /** A Firestore Timestamp cutoff: items created at/before this are expired. */
 function cutoffTs(): Timestamp {
   return Timestamp.fromMillis(Date.now() - EXPIRY_WINDOW_MS);
+}
+
+/** Cutoff for open lobby seats (uses the shorter lobby-specific window). */
+function lobbyCutoffTs(): Timestamp {
+  return Timestamp.fromMillis(Date.now() - LOBBY_SEAT_WINDOW_MS);
 }
 
 // ---- Sweep 1: pending offers (issuer leg locked → refund) -----------------
@@ -370,7 +388,7 @@ async function sweepStaleLobbySeats(): Promise<number> {
     .collection("stakes")
     .where("kind", "==", "outside")
     .where("status", "==", "open")
-    .where("createdAt", "<=", cutoffTs())
+    .where("createdAt", "<=", lobbyCutoffTs())
     .limit(SWEEP_BATCH_LIMIT)
     .get();
 
