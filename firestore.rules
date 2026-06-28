@@ -171,6 +171,14 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Precomputed leaderboards (server-owned). Two docs: players + circles.
+    // Any signed-in user may READ them (they're public rankings). Written ONLY
+    // by the scheduled Cloud Function (Admin SDK), so clients can't forge ranks.
+    match /leaderboards/{boardId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
     // EXPLICIT TERMINAL DENY (defense-in-depth / future-proofing).
     // Firestore already denies any path that matches no rule, so this is not
     // strictly required today. It exists to make that intent EXPLICIT and to

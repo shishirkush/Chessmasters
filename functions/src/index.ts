@@ -562,3 +562,4 @@ export {
   nominateGauntletDefender,
 } from "./conquest";
 export { expireStaleItems } from "./expiry";
+export { refreshLeaderboards } from "./leaderboards";

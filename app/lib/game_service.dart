@@ -433,6 +433,20 @@ class GameService {
         .call(<String, dynamic>{'seatId': seatId});
   }
 
+  // ---- LEADERBOARDS (precomputed, read a single doc each) ------------------
+
+  /// Live player leaderboard (top players by rating, >= 10 games). Reads the
+  /// single precomputed `leaderboards/players` doc.
+  Stream<DocumentSnapshot<Map<String, dynamic>>> playerLeaderboardStream() {
+    return _db.collection('leaderboards').doc('players').snapshots();
+  }
+
+  /// Live circle leaderboard (circles by top-quartile score). Reads the single
+  /// precomputed `leaderboards/circles` doc.
+  Stream<DocumentSnapshot<Map<String, dynamic>>> circleLeaderboardStream() {
+    return _db.collection('leaderboards').doc('circles').snapshots();
+  }
+
   /// Live list of the current user's ACTIVE games (in progress). Used to show
   /// a "Resume game" entry on the home screen — needed because a staked game
   /// is created server-side when the opponent accepts, so the issuer has no

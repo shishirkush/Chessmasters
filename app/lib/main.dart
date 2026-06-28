@@ -1044,6 +1044,16 @@ class _HomeScreenState extends State<HomeScreen> {
               icon: const Icon(Icons.public),
               label: const Text('Open Lobby'),
             ),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: _busy
+                  ? null
+                  : () => Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => LeaderboardScreen(service: _service),
+                      )),
+              icon: const Icon(Icons.leaderboard),
+              label: const Text('Leaderboards'),
+            ),
             const SizedBox(height: 16),
             if (_busy) const CircularProgressIndicator(),
             if (_status != null) ...[
@@ -3510,4 +3520,170 @@ class LobbyScreen extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Two-tab leaderboard screen: Players (by rating) and Circles (by top-quartile
+/// score). Both read a single precomputed doc each (written hourly by the
+/// refreshLeaderboards Cloud Function), so this is one cheap read per tab.
+/// Reached via the "Leaderboards" button on the home screen.
+class LeaderboardScreen extends StatelessWidget {
+  final GameService service;
+  const LeaderboardScreen({super.key, required this.service});
+
+  @override
+  Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Leaderboards'),
+          bottom: const TabBar(
+            tabs: [
+              Tab(text: 'Players'),
+              Tab(text: 'Circles'),
+            ],
+          ),
+        ),
+        body: TabBarView(
+          children: [
+            _PlayerBoard(service: service),
+            _CircleBoard(service: service),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Empty/loading helper shared by both boards.
+Widget _boardEmpty(String msg) => Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Text(msg,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.black54)),
+      ),
+    );
+
+class _PlayerBoard extends StatelessWidget {
+  final GameService service;
+  const _PlayerBoard({required this.service});
+
+  @override
+  Widget build(BuildContext context) {
+    final myUid = service.uid;
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: service.playerLeaderboardStream(),
+      builder: (context, snap) {
+        if (snap.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final data = snap.data?.data();
+        final entries =
+            (data?['entries'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+        if (entries.isEmpty) {
+          return _boardEmpty(
+              'No ranked players yet.\nPlayers appear here after 10 rated games.');
+        }
+        return ListView.separated(
+          itemCount: entries.length,
+          separatorBuilder: (_, __) => const Divider(height: 1),
+          itemBuilder: (context, i) {
+            final e = entries[i];
+            final isMe = e['uid'] == myUid;
+            final rank = i + 1;
+            return Container(
+              color: isMe ? const Color(0xFFF1F8E9) : null,
+              child: ListTile(
+                leading: _rankBadge(rank),
+                title: Text(
+                  (e['displayName'] ?? 'Player').toString(),
+                  style: TextStyle(
+                      fontWeight: isMe ? FontWeight.bold : FontWeight.normal),
+                ),
+                subtitle: Text('${e['gamesPlayed'] ?? 0} games'),
+                trailing: Text(
+                  '${(e['rating'] as num?)?.round() ?? '-'}',
+                  style: const TextStyle(
+                      fontWeight: FontWeight.bold, fontSize: 16),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class _CircleBoard extends StatelessWidget {
+  final GameService service;
+  const _CircleBoard({required this.service});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: service.circleLeaderboardStream(),
+      builder: (context, snap) {
+        if (snap.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final data = snap.data?.data();
+        final entries =
+            (data?['entries'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+        if (entries.isEmpty) {
+          return _boardEmpty(
+              'No ranked circles yet.\nCircles appear here once they have 10+ '
+              'members with enough rated players.');
+        }
+        return ListView.separated(
+          itemCount: entries.length,
+          separatorBuilder: (_, __) => const Divider(height: 1),
+          itemBuilder: (context, i) {
+            final e = entries[i];
+            final rank = i + 1;
+            return ListTile(
+              leading: _rankBadge(rank),
+              title: Text(
+                (e['name'] ?? 'Circle').toString(),
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+              subtitle: Text('${e['memberCount'] ?? 0} members · '
+                  'top ${e['quartileCount'] ?? 0} avg'),
+              trailing: Text(
+                '${(e['score'] as num?)?.round() ?? '-'}',
+                style:
+                    const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+/// A small rank badge (gold/silver/bronze for the top 3, plain otherwise).
+Widget _rankBadge(int rank) {
+  Color bg;
+  switch (rank) {
+    case 1:
+      bg = const Color(0xFFFFD54F); // gold
+      break;
+    case 2:
+      bg = const Color(0xFFB0BEC5); // silver
+      break;
+    case 3:
+      bg = const Color(0xFFBCAAA4); // bronze
+      break;
+    default:
+      bg = const Color(0xFFE0E0E0);
+  }
+  return CircleAvatar(
+    backgroundColor: bg,
+    radius: 18,
+    child: Text('$rank',
+        style: const TextStyle(
+            fontWeight: FontWeight.bold, color: Colors.black87)),
+  );
 }
