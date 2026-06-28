@@ -18,6 +18,7 @@
  */
 
 import * as functions from "firebase-functions/v1";
+import { onDocumentUpdated } from "firebase-functions/v2/firestore";
 import * as admin from "firebase-admin";
 import { FieldValue } from "firebase-admin/firestore";
 import { updatePlayer, RatingState } from "./glicko";
@@ -56,11 +57,22 @@ function readProfile(data: FirebaseFirestore.DocumentData | undefined): MiniProf
   };
 }
 
-export const onGameFinished = functions.firestore
-  .document("games/{gameId}")
-  .onUpdate(async (change, context) => {
-    const before = change.before.data();
-    const after = change.after.data();
+// V2 Firestore trigger (Eventarc-based), co-located in asia-southeast1
+// (Singapore) to match the chessmasters-sg Firestore database region. Firestore
+// triggers should live in the same region as the database they watch. We use v2
+// (Eventarc) which supports regional Firestore databases. This is the only
+// Firestore-trigger function; all callables/scheduled functions remain v1 in the
+// default us-central1 (mixing v1 and v2 in one codebase is supported).
+//
+// v2 differences from v1 handled below:
+//   - handler receives a single `event` (not `change, context`)
+//   - before/after snapshots: event.data.before / event.data.after
+//   - wildcard params: event.params.gameId (was context.params.gameId)
+export const onGameFinished = onDocumentUpdated(
+  { document: "games/{gameId}", region: "asia-southeast1" },
+  async (event) => {
+    const before = event.data?.before.data();
+    const after = event.data?.after.data();
 
     // Only act on the transition INTO finished.
     if (!after) return;
@@ -74,7 +86,7 @@ export const onGameFinished = functions.firestore
     // Need two real players and a decisive/draw result to rate.
     if (!whiteId || !blackId || !result) return;
 
-    const gameRef = change.after.ref;
+    const gameRef = event.data!.after.ref;
     const whiteRef = db.collection("users").doc(whiteId);
     const blackRef = db.collection("users").doc(blackId);
 
@@ -182,7 +194,7 @@ export const onGameFinished = functions.firestore
     ) {
       try {
         await settleStakeForGame(
-          context.params.gameId,
+          event.params.gameId,
           after.contextId,
           result
         );
@@ -206,7 +218,7 @@ export const onGameFinished = functions.firestore
     ) {
       try {
         await settleConquest(
-          context.params.gameId,
+          event.params.gameId,
           after.contextId,
           result
         );
@@ -246,7 +258,7 @@ export const onGameFinished = functions.firestore
     // them for both players. Query each player's notifications (single-field,
     // no index) and delete the ones whose data.gameId matches this game.
     try {
-      const gid = context.params.gameId;
+      const gid = event.params.gameId;
       const players = [whiteId, blackId].filter((p): p is string => !!p);
       for (const pid of players) {
         const snap = await db
