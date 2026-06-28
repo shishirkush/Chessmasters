@@ -1,6 +1,7 @@
 {
   "projects": {
-    "default": "chessmasters-dev"
+    "default": "chessmasters-dev",
+    "SG": "chessmasters-sg"
   },
   "targets": {},
   "etags": {}
