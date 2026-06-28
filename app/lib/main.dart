@@ -1034,6 +1034,16 @@ class _HomeScreenState extends State<HomeScreen> {
               icon: const Icon(Icons.groups),
               label: const Text('Circles'),
             ),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: _busy
+                  ? null
+                  : () => Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => LobbyScreen(service: _service),
+                      )),
+              icon: const Icon(Icons.public),
+              label: const Text('Open Lobby'),
+            ),
             const SizedBox(height: 16),
             if (_busy) const CircularProgressIndicator(),
             if (_status != null) ...[
@@ -3343,6 +3353,161 @@ class _OutgoingStakes extends StatelessWidget {
           ],
         );
       },
+    );
+  }
+}
+
+/// The OPEN LOBBY — staked play with strangers, outside any circle.
+/// Shows all open seats anyone can accept (each is a "outside"/"open" stake),
+/// a button to post your own seat, and (if you have one) your own open seat with
+/// a Cancel button. Accepting computes asymmetric stakes by rating and creates a
+/// game; the player then enters via the usual waiting banner ("always tap Enter"
+/// flow), so this screen doesn't navigate to the board itself.
+class LobbyScreen extends StatelessWidget {
+  final GameService service;
+  const LobbyScreen({super.key, required this.service});
+
+  Future<void> _post(BuildContext context) async {
+    try {
+      await service.postLobbySeat();
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('Seat posted. Waiting for someone to join…')));
+      }
+    } on FirebaseFunctionsException catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(e.message ?? 'Failed')));
+      }
+    }
+  }
+
+  Future<void> _accept(BuildContext context, String seatId) async {
+    try {
+      final r = await service.acceptLobbySeat(seatId);
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(
+                'Joined! You staked ${r['accepterStake']} CP. Tap Enter to start.')));
+      }
+    } on FirebaseFunctionsException catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(e.message ?? 'Failed')));
+      }
+    }
+  }
+
+  Future<void> _cancel(BuildContext context, String seatId) async {
+    try {
+      await service.cancelLobbySeat(seatId);
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Seat withdrawn.')));
+      }
+    } on FirebaseFunctionsException catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(e.message ?? 'Failed')));
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final myUid = service.uid;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Open Lobby')),
+      body: Column(
+        children: [
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
+            child: Text(
+              'Stake CP against anyone. Stakes scale by rating — the lower-rated '
+              'player risks less. You only commit CP when a game starts.',
+              style: TextStyle(color: Colors.black54),
+            ),
+          ),
+          Expanded(
+            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: service.openLobbySeatsStream(),
+              builder: (context, snap) {
+                if (snap.connectionState == ConnectionState.waiting) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                final docs = snap.data?.docs ?? [];
+                if (docs.isEmpty) {
+                  return const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(32),
+                      child: Text(
+                        'No open seats right now.\nPost one and wait for a '
+                        'challenger, or check back soon.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.black54),
+                      ),
+                    ),
+                  );
+                }
+                // Sort: my own seat first (so I can cancel it), then by newest.
+                final mine = docs.where((d) => d.data()['issuerId'] == myUid);
+                final others =
+                    docs.where((d) => d.data()['issuerId'] != myUid).toList();
+                final ordered = [...mine, ...others];
+
+                return ListView.separated(
+                  itemCount: ordered.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: (context, i) {
+                    final d = ordered[i];
+                    final s = d.data();
+                    final seatId = d.id;
+                    final isMine = s['issuerId'] == myUid;
+                    final rating = (s['posterRating'] ?? 1500);
+                    final ratingStr = (rating is num)
+                        ? rating.round().toString()
+                        : rating.toString();
+
+                    if (isMine) {
+                      return ListTile(
+                        leading: const CircleAvatar(
+                          backgroundColor: Color(0xFFE8EAF6),
+                          child: Icon(Icons.person, color: Colors.indigo),
+                        ),
+                        title: const Text('Your open seat'),
+                        subtitle: Text('Rating $ratingStr · waiting for a challenger'),
+                        trailing: TextButton.icon(
+                          icon: const Icon(Icons.close, size: 18),
+                          label: const Text('Cancel'),
+                          onPressed: () => _cancel(context, seatId),
+                        ),
+                      );
+                    }
+                    return ListTile(
+                      leading: const CircleAvatar(
+                        backgroundColor: Color(0xFFE3F2FD),
+                        child: Icon(Icons.public, color: Colors.blue),
+                      ),
+                      title: Text('Open seat · rating $ratingStr'),
+                      subtitle: const Text(
+                          'Tap Join — stakes are set by the rating gap'),
+                      trailing: FilledButton(
+                        onPressed: () => _accept(context, seatId),
+                        child: const Text('Join'),
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => _post(context),
+        icon: const Icon(Icons.add),
+        label: const Text('Post a seat'),
+      ),
     );
   }
 }

@@ -391,6 +391,48 @@ class GameService {
         .snapshots();
   }
 
+  // ---- OPEN LOBBY (staked play with strangers, gameType "outside") ---------
+
+  /// Live list of OPEN lobby seats anyone can accept (kind "outside", status
+  /// "open"). Public by design — the security rules allow any signed-in user to
+  /// read open seats. Includes the caller's own seat (filter it in the UI if you
+  /// want to show it separately with a Cancel button).
+  Stream<QuerySnapshot<Map<String, dynamic>>> openLobbySeatsStream() {
+    return _db
+        .collection('stakes')
+        .where('kind', isEqualTo: 'outside')
+        .where('status', isEqualTo: 'open')
+        .snapshots();
+  }
+
+  /// Post an open lobby seat. Locks nothing (the asymmetric stake is computed
+  /// when someone accepts). Throws FirebaseFunctionsException (e.g.
+  /// 'resource-exhausted' if you already have an open seat).
+  Future<String> postLobbySeat() async {
+    final res =
+        await _fns.httpsCallable('postLobbySeat').call(<String, dynamic>{});
+    return (res.data as Map)['seatId'] as String;
+  }
+
+  /// Accept an open lobby seat. Computes both asymmetric stakes from the rating
+  /// gap, locks both legs, and creates the game. Throws
+  /// FirebaseFunctionsException on any precondition failure (seat gone, can't
+  /// afford, daily cap, etc.).
+  Future<Map<String, dynamic>> acceptLobbySeat(String seatId) async {
+    final res = await _fns
+        .httpsCallable('acceptLobbySeat')
+        .call(<String, dynamic>{'seatId': seatId});
+    return Map<String, dynamic>.from(res.data as Map);
+  }
+
+  /// Cancel (withdraw) your own open lobby seat. Nothing was locked, so nothing
+  /// is refunded.
+  Future<void> cancelLobbySeat(String seatId) async {
+    await _fns
+        .httpsCallable('cancelLobbySeat')
+        .call(<String, dynamic>{'seatId': seatId});
+  }
+
   /// Live list of the current user's ACTIVE games (in progress). Used to show
   /// a "Resume game" entry on the home screen — needed because a staked game
   /// is created server-side when the opponent accepts, so the issuer has no

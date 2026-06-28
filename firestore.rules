@@ -112,17 +112,26 @@ service cloud.firestore {
       allow create: if false; // server-only
     }
 
-    // SLICE 3c: peer stakes (server-owned).
-    // A signed-in user may READ a stake only if they are a party to it (the
-    // issuer or the challenged opponent) — so each side can see pending offers
-    // and the linked game. NO client writes: propose/accept/cancel/decline and
-    // settlement all run in Cloud Functions via the Admin SDK. This keeps CP
-    // escrow and pot settlement entirely server-authoritative.
+    // SLICE 3c: peer stakes + challenge-ups + lobby seats (server-owned).
+    // A signed-in user may READ a stake if they are a party to it (issuer or
+    // opponent) — so each side sees pending offers and the linked game.
+    // ADDITIONALLY, OPEN LOBBY SEATS are public: a seat with kind "outside" and
+    // status "open" is a public invitation anyone can browse and accept, so any
+    // signed-in user may read it (this is what powers the lobby list). Once a
+    // seat is accepted it becomes party-scoped like any other stake (issuer =
+    // poster, opponentId = accepter), so it's no longer world-readable. NO
+    // client writes: propose/accept/cancel/decline/post and settlement all run
+    // in Cloud Functions via the Admin SDK — CP escrow and pots stay server-
+    // authoritative.
     match /stakes/{stakeId} {
       allow read: if request.auth != null
                   && (
                        request.auth.uid == resource.data.issuerId
                        || request.auth.uid == resource.data.opponentId
+                       || (
+                            resource.data.kind == 'outside'
+                            && resource.data.status == 'open'
+                          )
                      );
       allow write: if false;
     }
