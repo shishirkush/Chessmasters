@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 
 /// All backend contact lives here. The app sends INTENTS (callable
@@ -67,6 +68,14 @@ class GameService {
   /// Sign out of both Firebase and Google (so the next sign-in re-prompts
   /// for account choice rather than silently reusing the last account).
   Future<void> signOut() async {
+    // Stop this device receiving pushes meant for the account being signed out
+    // (important if a DIFFERENT account later signs in on this same device).
+    // Must run BEFORE _auth.signOut() — the callable needs the user authed.
+    // Best-effort: never block sign-out on token cleanup.
+    try {
+      final token = await FirebaseMessaging.instance.getToken();
+      if (token != null) await unregisterFcmToken(token);
+    } catch (_) {}
     // Each step is guarded: a stale/invalid token can make one throw, and we
     // still want the rest to run so local auth state is fully cleared.
     try {
@@ -75,6 +84,24 @@ class GameService {
     try {
       await _auth.signOut();
     } catch (_) {}
+  }
+
+  /// Save this device's FCM token server-side (registerFcmToken callable).
+  /// Called once after sign-in and again whenever the token rotates. The server
+  /// upserts users/{uid}/fcmTokens/{token}; calling it repeatedly is harmless.
+  Future<void> registerFcmToken(String token) async {
+    await _fns.httpsCallable('registerFcmToken').call(<String, dynamic>{
+      'token': token,
+      'platform': 'android',
+    });
+  }
+
+  /// Remove this device's FCM token server-side (unregisterFcmToken callable).
+  /// Called on sign-out so this device stops receiving the account's pushes.
+  Future<void> unregisterFcmToken(String token) async {
+    await _fns.httpsCallable('unregisterFcmToken').call(<String, dynamic>{
+      'token': token,
+    });
   }
 
   /// True if an error is the stale-refresh-token / unauthenticated signature

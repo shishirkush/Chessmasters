@@ -563,3 +563,8 @@ export {
 } from "./conquest";
 export { expireStaleItems } from "./expiry";
 export { refreshLeaderboards } from "./leaderboards";
+export {
+  registerFcmToken,
+  unregisterFcmToken,
+  onNotificationCreated,
+} from "./fcm";

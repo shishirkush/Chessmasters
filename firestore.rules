@@ -49,6 +49,15 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // FCM device tokens: server-owned. Written ONLY via the registerFcmToken /
+    // unregisterFcmToken callables and read ONLY by the onNotificationCreated
+    // push trigger — all Admin SDK, which bypasses rules. Clients have NO direct
+    // path (a token list is sensitive: it identifies a user's devices). The
+    // terminal deny below already covers this; stated explicitly for clarity.
+    match /users/{userId}/fcmTokens/{token} {
+      allow read, write: if false;
+    }
+
     // SLICE 2c: circles (social spaces).
     // Readable by any signed-in user (needed for search/browse in 2d and to
     // view membership). Created/modified/deleted ONLY by Cloud Functions

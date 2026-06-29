@@ -4,13 +4,15 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_functions/cloud_functions.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:simple_chess_board/simple_chess_board.dart';
 
 import 'game_service.dart';
+import 'fcm_messaging.dart';
 
 // Toggle this to true while testing against the local Firebase emulators.
-const bool kUseEmulator = true;
+const bool kUseEmulator = false;
 
 // Host the app uses to reach the Firebase emulators.
 //   - Android EMULATOR  → '10.0.2.2'   (special alias for the host machine)
@@ -30,6 +32,12 @@ Future<void> main() async {
     FirebaseFunctions.instance.useFunctionsEmulator(kEmulatorHost, 5001);
     await FirebaseAuth.instance.useAuthEmulator(kEmulatorHost, 9099);
   }
+
+  // FCM background/terminated message handler. Must be registered before
+  // runApp and must reference a top-level function. (Note: FCM has no emulator
+  // and is not affected by kUseEmulator — pushes always go through real
+  // Firebase / Google Play Services on the device.)
+  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
 
   runApp(const ChessMastersApp());
 }
@@ -897,6 +905,12 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    // The AuthGate only builds HomeScreen when a user is signed in, so this is
+    // the right point to register this device for push. Fire-and-forget: it
+    // requests notification permission, registers the FCM token server-side,
+    // and keeps it fresh. Failures are swallowed inside setupFcm (the in-app
+    // bell still works without push).
+    setupFcm(_service);
   }
 
   @override
