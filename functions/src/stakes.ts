@@ -47,7 +47,12 @@ import {
   bumpOpponent,
   SAME_OPPONENT_DAILY_CAP,
 } from "./counters";
-import { challengeStakeAmount } from "./challenge";
+import {
+  challengeStakeAmount,
+  lobbyAccepterStake,
+  validateLobbyPosterStake,
+  LOBBY_ACCEPTER_FLOOR,
+} from "./challenge";
 
 import { db } from "./init";
 import { notify, notifyTx, deleteOfferNotifications } from "./notify";
@@ -687,7 +692,9 @@ export const proposeChallengeUp = functions.https.onCall(
     // or higher-rated challengers are rejected (use a peer stake instead).
     const issuerSnap = await db.collection("users").doc(issuerId).get();
     const issuerRating = (issuerSnap.get("rating") as number) ?? 1500;
+    const issuerRd = (issuerSnap.get("rd") as number) ?? 350;
     const opponentRating = (oppSnap.get("rating") as number) ?? 1500;
+    const opponentRd = (oppSnap.get("rd") as number) ?? 350;
     if (issuerRating >= opponentRating) {
       throw new functions.https.HttpsError(
         "failed-precondition",
@@ -728,14 +735,16 @@ export const proposeChallengeUp = functions.https.onCall(
       const opponentBal = await readCpInTx(tx, opponentId);
 
       // Compute both legs against propose-time ratings/balances and FIX them.
+      // Glicko-2 win-probability (RD-weighted) drives the fraction; we snapshot
+      // rating+rd below so the fixed terms are auditable.
       const issuerStake = challengeStakeAmount(
-        issuerRating,
-        opponentRating,
+        { rating: issuerRating, rd: issuerRd },
+        { rating: opponentRating, rd: opponentRd },
         issuerBal
       );
       const opponentStake = challengeStakeAmount(
-        opponentRating,
-        issuerRating,
+        { rating: opponentRating, rd: opponentRd },
+        { rating: issuerRating, rd: issuerRd },
         opponentBal
       );
       if (issuerStake < MIN_STAKE || opponentStake < MIN_STAKE) {
@@ -788,6 +797,8 @@ export const proposeChallengeUp = functions.https.onCall(
         // Snapshot the ratings the terms were computed from (audit/debug).
         proposeIssuerRating: issuerRating,
         proposeOpponentRating: opponentRating,
+        proposeIssuerRd: issuerRd,
+        proposeOpponentRd: opponentRd,
         gameId: null,
         pot: null,
         settledResult: null,
@@ -1027,12 +1038,26 @@ const MAX_OPEN_LOBBY_SEATS = 1;
 
 /**
  * Post an open lobby seat. Locks NOTHING (the asymmetric stake isn't known
- * until someone accepts). Enforces the one-open-seat cap and a minimum-balance
- * sanity check (you must at least be able to cover MIN_STAKE — the real, larger
- * amount is checked at accept against the actual rating gap).
+ * until someone accepts). The POSTER chooses their exact stake S (200+, in 50s,
+ * up to 40% of their balance — validateLobbyPosterStake enforces this). Nothing
+ * is locked at post (the accepter's anchored amount isn't known until accept);
+ * the one-open-seat cap keeps that safe. The chosen S and the poster's
+ * rating+rd are stored so the accepter's stake can be computed (anchored to S,
+ * scaled by the Glicko win odds) when someone takes the seat.
  */
 export const postLobbySeat = functions.https.onCall(async (data, context) => {
   const uid = requireAuth(context);
+
+  // The poster's chosen stake S (the amount THEY will risk). Validated below
+  // against the live balance (floor 200, ≤40% cap, steps of 50).
+  const stake: number | undefined =
+    typeof data?.stake === "number" ? data.stake : undefined;
+  if (typeof stake !== "number" || !Number.isInteger(stake)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "A whole-number stake is required to post a lobby seat."
+    );
+  }
 
   // One open seat per player (Resolution C). Authoritative check is in the tx;
   // this is a fast early error.
@@ -1052,14 +1077,13 @@ export const postLobbySeat = functions.https.onCall(async (data, context) => {
 
   const seatRef = db.collection("stakes").doc();
   await db.runTransaction(async (tx) => {
-    // Sanity: must be able to cover at least the minimum stake. (The real
-    // asymmetric amount is computed and checked when someone accepts.)
+    // Validate the chosen stake against the poster's LIVE balance: ≥200,
+    // ≤40% of balance, in steps of 50. (Also rejects posters whose 40% cap
+    // can't reach the 200 floor — i.e. balance < 500.)
     const bal = await readCpInTx(tx, uid);
-    if (bal < MIN_STAKE) {
-      throw new functions.https.HttpsError(
-        "failed-precondition",
-        `You need at least ${MIN_STAKE} CP to post a lobby seat.`
-      );
+    const reason = validateLobbyPosterStake(stake, bal);
+    if (reason) {
+      throw new functions.https.HttpsError("failed-precondition", reason);
     }
 
     // Re-check the one-seat cap inside the tx (race-safe).
@@ -1077,9 +1101,12 @@ export const postLobbySeat = functions.https.onCall(async (data, context) => {
       );
     }
 
-    // Snapshot the poster's rating for display + future rating-band guardrails.
+    // Snapshot the poster's rating AND rd: rating for display, rd so the
+    // accepter's Glicko-odds stake can be computed at accept (and previewed
+    // client-side). posterStake is the poster's fixed leg.
     const profile = await tx.get(db.collection("users").doc(uid));
     const posterRating = (profile.get("rating") as number) ?? 1500;
+    const posterRd = (profile.get("rd") as number) ?? 350;
 
     tx.set(seatRef, {
       kind: "outside", // open lobby / stranger game
@@ -1092,7 +1119,9 @@ export const postLobbySeat = functions.https.onCall(async (data, context) => {
       pot: null,
       settledResult: null,
       settled: false,
-      posterRating, // for the lobby list + V2 rating-band checks
+      posterStake: stake, // the poster's CHOSEN, fixed leg (S)
+      posterRating, // for the lobby list + accepter odds + V2 rating-band checks
+      posterRd, // for the accepter's Glicko-odds stake (compute + client preview)
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });
@@ -1146,11 +1175,13 @@ export const acceptLobbySeat = functions.https.onCall(async (data, context) => {
       );
     }
 
-    // Live ratings (for the asymmetric formula) and balances (for the cap).
+    // Live ratings + RD (for the Glicko odds) and balances (for the cap).
     const posterProfile = await tx.get(db.collection("users").doc(posterId));
     const accepterProfile = await tx.get(db.collection("users").doc(uid));
     const posterRating = (posterProfile.get("rating") as number) ?? 1500;
+    const posterRd = (posterProfile.get("rd") as number) ?? 350;
     const accepterRating = (accepterProfile.get("rating") as number) ?? 1500;
+    const accepterRd = (accepterProfile.get("rd") as number) ?? 350;
 
     const posterBal = await readCpInTx(tx, posterId);
     const accepterBal = await readCpInTx(tx, uid);
@@ -1169,17 +1200,25 @@ export const acceptLobbySeat = functions.https.onCall(async (data, context) => {
       );
     }
 
-    // Asymmetric stakes: each stakes their OWN challenge-up fraction vs the
-    // other's rating, against their OWN balance. Underdog (lower rating) stakes
-    // the larger fraction. Computed NOW (at accept) since the opponent is known.
-    const posterStake = challengeStakeAmount(
-      posterRating,
-      accepterRating,
-      posterBal
-    );
-    const accepterStake = challengeStakeAmount(
-      accepterRating,
-      posterRating,
+    // POSTER's leg = the stake they CHOSE at post (fixed). Fall back to a live
+    // computation only for legacy seats posted before posterStake existed (test
+    // data is wiped, but this keeps a stray old seat from crashing).
+    const posterStake: number =
+      typeof s.posterStake === "number"
+        ? s.posterStake
+        : challengeStakeAmount(
+            { rating: posterRating, rd: posterRd },
+            { rating: accepterRating, rd: accepterRd },
+            posterBal
+          );
+
+    // ACCEPTER's leg = anchored to the poster's stake, scaled by the Glicko win
+    // odds, clamped (floor 200, ceiling min(3×S, 40% of balance)). A favorite
+    // stakes up to 3×; an underdog down to 200.
+    const accepterStake = lobbyAccepterStake(
+      posterStake,
+      { rating: accepterRating, rd: accepterRd },
+      { rating: posterRating, rd: posterRd },
       accepterBal
     );
 
@@ -1208,10 +1247,19 @@ export const acceptLobbySeat = functions.https.onCall(async (data, context) => {
         "Stake exceeds the poster's per-game limit — seat can't be filled."
       );
     }
-    if (accepterStake > Math.floor(accepterBal * MAX_STAKE_FRACTION)) {
+    // The accepter's clamp already caps at 40% of balance; this guards the case
+    // where the clamp's ceiling fell BELOW the 200 floor (40% of their balance
+    // < 200), which lobbyAccepterStake signals by returning a sub-floor value:
+    // they simply can't afford this seat at the required minimum.
+    if (
+      accepterStake > Math.floor(accepterBal * MAX_STAKE_FRACTION) ||
+      accepterStake < LOBBY_ACCEPTER_FLOOR
+    ) {
       throw new functions.https.HttpsError(
         "failed-precondition",
-        `Stake exceeds ${Math.round(MAX_STAKE_FRACTION * 100)}% of your balance.`
+        `You need at least ${Math.ceil(
+          LOBBY_ACCEPTER_FLOOR / MAX_STAKE_FRACTION
+        )} CP to accept this seat.`
       );
     }
 

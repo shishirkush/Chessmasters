@@ -124,3 +124,35 @@ export function updatePlayer(
     vol: newSigma,
   };
 }
+
+// ---- Public win-probability (shared by stake-sizing) ----------------------
+
+/**
+ * The probability that `player` beats `opponent`, on the Glicko-2 model.
+ *
+ * This is the SAME expectation the rating update uses internally (E(mu, mu_j,
+ * phi_j) above), exposed for reuse by the CP stake-sizing code so that staking
+ * and rating speak one language — there is no separate Elo formula anywhere.
+ *
+ * Glicko-2 (unlike Elo) weights the gap by the OPPONENT's rating deviation via
+ * g(phi_j): when the opponent's rating is uncertain (high RD, e.g. a new or
+ * provisional player), the result is less predictable, so the probability is
+ * pulled toward 0.5 — the rating gap "counts for less". As the opponent's RD
+ * shrinks with games played, g(phi_j) -> 1 and this converges toward the plain
+ * logistic (Elo-like) curve. This is why stake spreads are gentle while ratings
+ * are unsettled and steepen as the population matures.
+ *
+ * Inputs are PUBLIC-scale {rating, rd} (the values stored on user docs). The
+ * conversion to the internal Glicko-2 scale happens here.
+ *
+ * @returns a probability in (0, 1).
+ */
+export function winProbability(
+  player: { rating: number; rd: number },
+  opponent: { rating: number; rd: number }
+): number {
+  const mu = (player.rating - 1500) / SCALE;
+  const muJ = (opponent.rating - 1500) / SCALE;
+  const phiJ = opponent.rd / SCALE; // opponent's RD weights the expectation
+  return 1 / (1 + Math.exp(-g(phiJ) * (mu - muJ)));
+}

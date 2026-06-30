@@ -3392,11 +3392,86 @@ class LobbyScreen extends StatelessWidget {
   const LobbyScreen({super.key, required this.service});
 
   Future<void> _post(BuildContext context) async {
+    // Read the poster's live balance to bound the picker (200 .. 40% cap, in 50s).
+    final me = await service.myRatingRdCp();
+    final maxStake = GameService.lobbyPosterMaxStake(me.cp);
+    if (!context.mounted) return;
+    if (maxStake < GameService.lobbyStakeFloor) {
+      // Their 40% cap can't reach the 200 floor → can't post yet.
+      final need =
+          (GameService.lobbyStakeFloor / GameService.lobbyMaxStakeFraction)
+              .ceil();
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(
+              'You need at least $need CP to post a seat. You have ${me.cp} CP — '
+              'play a few games for your daily CP.')));
+      return;
+    }
+
+    final chosen = await showDialog<int>(
+      context: context,
+      builder: (ctx) {
+        int stake = GameService.lobbyStakeFloor; // default to the floor (200)
+        return StatefulBuilder(
+          builder: (ctx, setState) => AlertDialog(
+            title: const Text('Post a lobby seat'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                    'Choose how much CP you risk. The challenger matches you '
+                    'based on the rating gap — a stronger challenger stakes more.'),
+                const SizedBox(height: 16),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.remove_circle_outline),
+                      onPressed: stake > GameService.lobbyStakeFloor
+                          ? () => setState(() =>
+                              stake -= GameService.lobbyStakeStep)
+                          : null,
+                    ),
+                    Text('$stake CP',
+                        style: const TextStyle(
+                            fontSize: 22, fontWeight: FontWeight.bold)),
+                    IconButton(
+                      icon: const Icon(Icons.add_circle_outline),
+                      onPressed: stake < maxStake
+                          ? () => setState(() =>
+                              stake += GameService.lobbyStakeStep)
+                          : null,
+                    ),
+                  ],
+                ),
+                Center(
+                  child: Text('Max $maxStake CP (40% of your balance)',
+                      style: const TextStyle(
+                          color: Colors.black54, fontSize: 12)),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('Cancel')),
+              FilledButton(
+                  onPressed: () => Navigator.pop(ctx, stake),
+                  child: const Text('Post seat')),
+            ],
+          ),
+        );
+      },
+    );
+    if (chosen == null || !context.mounted) return;
+
     try {
-      await service.postLobbySeat();
+      await service.postLobbySeat(chosen);
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text('Seat posted. Waiting for someone to join…')));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(
+                'Seat posted for $chosen CP. Waiting for someone to join…')));
       }
     } on FirebaseFunctionsException catch (e) {
       if (context.mounted) {
@@ -3406,7 +3481,106 @@ class LobbyScreen extends StatelessWidget {
     }
   }
 
-  Future<void> _accept(BuildContext context, String seatId) async {
+  Future<void> _accept(
+    BuildContext context,
+    String seatId,
+    Map<String, dynamic> seat,
+  ) async {
+    // Compute a client-side preview of what the accepter risks vs the poster,
+    // so the player sees the deal BEFORE committing. The server recomputes
+    // authoritatively on accept (so these are '~' estimates).
+    final me = await service.myRatingRdCp();
+    if (!context.mounted) return;
+
+    int asInt(dynamic v, int dflt) =>
+        v is int ? v : (v is num ? v.toInt() : dflt);
+    final posterStake = asInt(seat['posterStake'], 0);
+    final posterRating = asInt(seat['posterRating'], 1500);
+    final posterRd = asInt(seat['posterRd'], 350);
+
+    // Legacy seat (pre-redesign) with no posterStake: skip the preview, let the
+    // server decide. (Test data is wiped, so this is just defensive.)
+    if (posterStake <= 0) {
+      await _doAccept(context, seatId);
+      return;
+    }
+
+    final yourStake = GameService.lobbyAccepterStakePreview(
+      posterStake: posterStake,
+      accepterRating: me.rating,
+      accepterRd: me.rd,
+      posterRating: posterRating,
+      posterRd: posterRd,
+      accepterBalance: me.cp,
+    );
+
+    // Can't afford the required minimum (40% cap below the floor, or below the
+    // computed stake): tell them, don't open the accept.
+    if (yourStake < GameService.lobbyStakeFloor || me.cp < yourStake) {
+      final need =
+          (GameService.lobbyStakeFloor / GameService.lobbyMaxStakeFraction)
+              .ceil();
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(
+              'You need at least $need CP to accept this seat. You have ${me.cp} CP.')));
+      return;
+    }
+
+    final pot = yourStake + posterStake;
+    final rake = (pot * 0.05).round();
+    final ifWin = pot - rake - yourStake; // net gain if you win
+    final favored = me.rating >= posterRating;
+
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Accept this seat?'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Opponent rating $posterRating'),
+            const Divider(height: 20),
+            _row('You risk', '~$yourStake CP'),
+            _row('They risk', '$posterStake CP'),
+            _row('If you win', '~+$ifWin CP'),
+            _row('If you lose', '−$yourStake CP'),
+            const SizedBox(height: 8),
+            Text(
+              favored
+                  ? "You're favored to win this one."
+                  : "You're the underdog — a win means a bigger rating gain.",
+              style: const TextStyle(color: Colors.black54, fontSize: 12),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Accept')),
+        ],
+      ),
+    );
+    if (go == true && context.mounted) {
+      await _doAccept(context, seatId);
+    }
+  }
+
+  static Widget _row(String label, String value) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(label, style: const TextStyle(color: Colors.black54)),
+            Text(value, style: const TextStyle(fontWeight: FontWeight.bold)),
+          ],
+        ),
+      );
+
+  Future<void> _doAccept(BuildContext context, String seatId) async {
     try {
       final r = await service.acceptLobbySeat(seatId);
       if (context.mounted) {
@@ -3491,6 +3665,9 @@ class LobbyScreen extends StatelessWidget {
                     final ratingStr = (rating is num)
                         ? rating.round().toString()
                         : rating.toString();
+                    final pStake = s['posterStake'];
+                    final stakeStr =
+                        (pStake is num) ? pStake.round().toString() : null;
 
                     if (isMine) {
                       return ListTile(
@@ -3499,7 +3676,9 @@ class LobbyScreen extends StatelessWidget {
                           child: Icon(Icons.person, color: Colors.indigo),
                         ),
                         title: const Text('Your open seat'),
-                        subtitle: Text('Rating $ratingStr · waiting for a challenger'),
+                        subtitle: Text(stakeStr != null
+                            ? 'You staked $stakeStr CP · rating $ratingStr · waiting for a challenger'
+                            : 'Rating $ratingStr · waiting for a challenger'),
                         trailing: TextButton.icon(
                           icon: const Icon(Icons.close, size: 18),
                           label: const Text('Cancel'),
@@ -3512,11 +3691,13 @@ class LobbyScreen extends StatelessWidget {
                         backgroundColor: Color(0xFFE3F2FD),
                         child: Icon(Icons.public, color: Colors.blue),
                       ),
-                      title: Text('Open seat · rating $ratingStr'),
+                      title: stakeStr != null
+                          ? Text('Open seat · $stakeStr CP · rating $ratingStr')
+                          : Text('Open seat · rating $ratingStr'),
                       subtitle: const Text(
-                          'Tap Join — stakes are set by the rating gap'),
+                          'Tap Join to see what you risk before committing'),
                       trailing: FilledButton(
-                        onPressed: () => _accept(context, seatId),
+                        onPressed: () => _accept(context, seatId, s),
                         child: const Text('Join'),
                       ),
                     );

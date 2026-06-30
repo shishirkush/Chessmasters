@@ -235,6 +235,23 @@ class GameService {
     return _db.collection('users').doc(id).snapshots();
   }
 
+  /// One-shot read of the current user's {rating, rd, cp} — for the lobby stake
+  /// picker (poster max) and the accept-stake preview, which need rating+rd+cp
+  /// at the moment the dialog opens. Returns sensible defaults if missing.
+  Future<({int rating, int rd, int cp})> myRatingRdCp() async {
+    final id = uid;
+    if (id == null) return (rating: 1500, rd: 350, cp: 0);
+    final snap = await _db.collection('users').doc(id).get();
+    final d = snap.data() ?? <String, dynamic>{};
+    int asInt(dynamic v, int dflt) =>
+        v is int ? v : (v is num ? v.toInt() : dflt);
+    return (
+      rating: asInt(d['rating'], 1500),
+      rd: asInt(d['rd'], 350),
+      cp: asInt(d['cp'], 0),
+    );
+  }
+
   /// Live CP balance for the current user.
   ///
   /// Reads the denormalized `cp` field on the user's profile doc — an O(1)
@@ -433,11 +450,14 @@ class GameService {
   }
 
   /// Post an open lobby seat. Locks nothing (the asymmetric stake is computed
-  /// when someone accepts). Throws FirebaseFunctionsException (e.g.
-  /// 'resource-exhausted' if you already have an open seat).
-  Future<String> postLobbySeat() async {
-    final res =
-        await _fns.httpsCallable('postLobbySeat').call(<String, dynamic>{});
+  /// when someone accepts). [stake] is the poster's chosen CP to risk (200+, in
+  /// steps of 50, up to 40% of their balance — the server validates). Throws
+  /// FirebaseFunctionsException ('resource-exhausted' if you already have an
+  /// open seat; 'failed-precondition' if the stake is out of range).
+  Future<String> postLobbySeat(int stake) async {
+    final res = await _fns
+        .httpsCallable('postLobbySeat')
+        .call(<String, dynamic>{'stake': stake});
     return (res.data as Map)['seatId'] as String;
   }
 
@@ -669,24 +689,100 @@ class GameService {
 
   /// Client-side preview of the breach stake (display only — the server is
   /// authoritative at initiateBreach). A pure Dart port of challengeStakeAmount
-  /// (challenge.ts): the challenge-up fraction of [myBalance], scaled by the
-  /// rating gap vs the circle owner, clamped at the 40% cap, floored to an int.
+  /// (challenge.ts), now Glicko-2: the challenge-up fraction of [myBalance],
+  /// scaled by the Glicko win probability vs the circle owner (RD-weighted),
+  /// clamped at the 40% cap, floored to an int.
   ///
   /// Lets the challenger screen show an instant "~X CP" estimate before the
-  /// getBreachEligibility round-trip returns the authoritative number.
+  /// getBreachEligibility round-trip returns the authoritative number. Because
+  /// it is Glicko, it needs both players' RD — pass them from the user docs.
   static int estimateBreachStake({
     required int myRating,
+    required int myRd,
     required int ownerRating,
+    required int ownerRd,
     required int myBalance,
   }) {
     const baseFraction = 0.05;
     const spread = 0.35;
-    const maxFraction = 0.40; // raised 0.30 -> 0.40 (matches challenge.ts)
-    // Elo expected score for the challenger vs the owner.
-    final exp = 1 / (1 + math.pow(10, (ownerRating - myRating) / 400));
-    final frac = baseFraction + (1 - exp) * spread;
+    const maxFraction = 0.40; // §5 cap (matches challenge.ts)
+    final p = _glickoWinProbability(
+      rating: myRating.toDouble(),
+      rd: myRd.toDouble(),
+      oppRating: ownerRating.toDouble(),
+      oppRd: ownerRd.toDouble(),
+    );
+    final frac = baseFraction + (1 - p) * spread;
     final capped = frac < maxFraction ? frac : maxFraction;
     return (myBalance * capped).floor();
+  }
+
+  // ---- Lobby stake previews (pure Dart ports of challenge.ts) ---------------
+  // Display-only estimates so the poster's picker and the accepter's dialog can
+  // show numbers instantly; the SERVER recomputes authoritatively at post/accept
+  // (so the figures shown are estimates — '~' them in the UI).
+
+  static const int lobbyStakeFloor = 200; // LOBBY_ACCEPTER_FLOOR
+  static const int lobbyStakeStep = 50; // LOBBY_STAKE_STEP
+  static const int lobbyCeilingMult = 3; // LOBBY_CEILING_MULT
+  static const double _maxStakeFraction = 0.40;
+  /// Public alias of the §5 cap fraction, for UI "need X CP" math in main.dart.
+  static const double lobbyMaxStakeFraction = _maxStakeFraction;
+
+  /// The most a poster with [balance] CP may stake on a lobby seat: 40% of
+  /// balance, rounded DOWN to a multiple of 50 (so the picker's max is a valid
+  /// step). Returns 0 if they can't even reach the 200 floor (balance < 500),
+  /// which the UI uses to show "you need ≥500 CP to post".
+  static int lobbyPosterMaxStake(int balance) {
+    final cap = (balance * _maxStakeFraction).floor();
+    if (cap < lobbyStakeFloor) return 0; // can't post
+    // largest (floor + k*step) ≤ cap
+    final steps = (cap - lobbyStakeFloor) ~/ lobbyStakeStep;
+    return lobbyStakeFloor + steps * lobbyStakeStep;
+  }
+
+  /// Preview of the ACCEPTER's stake for a seat whose poster staked
+  /// [posterStake], given the accepter's and poster's rating+rd and the
+  /// accepter's balance. Mirrors lobbyAccepterStake (challenge.ts):
+  ///   raw = round(S * p/(1-p));  clamp(raw, 200, min(3*S, 40% of balance)).
+  /// Returns the clamped int (may be below 200 if the accepter's 40% cap can't
+  /// reach the floor — the dialog then shows "you need ≥X CP to accept").
+  static int lobbyAccepterStakePreview({
+    required int posterStake,
+    required int accepterRating,
+    required int accepterRd,
+    required int posterRating,
+    required int posterRd,
+    required int accepterBalance,
+  }) {
+    final p = _glickoWinProbability(
+      rating: accepterRating.toDouble(),
+      rd: accepterRd.toDouble(),
+      oppRating: posterRating.toDouble(),
+      oppRd: posterRd.toDouble(),
+    );
+    final pSafe = p.clamp(1e-6, 1 - 1e-6);
+    final raw = (posterStake * (pSafe / (1 - pSafe))).round();
+    final balanceCap = (accepterBalance * _maxStakeFraction).floor();
+    final ceiling = math.min(lobbyCeilingMult * posterStake, balanceCap);
+    final floored = math.max(raw, lobbyStakeFloor);
+    return math.min(floored, ceiling);
+  }
+
+  /// Glicko-2 win probability — a Dart port of glicko.ts `winProbability`.
+  /// Opponent RD weights the gap via g(phi_opp); inputs are public-scale.
+  static double _glickoWinProbability({
+    required double rating,
+    required double rd,
+    required double oppRating,
+    required double oppRd,
+  }) {
+    const scale = 173.7178;
+    final mu = (rating - 1500) / scale;
+    final muJ = (oppRating - 1500) / scale;
+    final phiJ = oppRd / scale;
+    final g = 1 / math.sqrt(1 + (3 * phiJ * phiJ) / (math.pi * math.pi));
+    return 1 / (1 + math.exp(-g * (mu - muJ)));
   }
 
   // ---- Slice 4: Gauntlet (commit 2) ----------------------------------------

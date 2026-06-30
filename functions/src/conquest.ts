@@ -151,10 +151,16 @@ export const getBreachEligibility = functions.https.onCall(
       db.collection("users").doc(challengerId).get(),
     ]);
     const ownerRating = (ownerSnap.get("rating") as number) ?? 1500;
+    const ownerRd = (ownerSnap.get("rd") as number) ?? 350;
     const myRating = (challengerSnap.get("rating") as number) ?? 1500;
+    const myRd = (challengerSnap.get("rd") as number) ?? 350;
     const myBalance = await computeBalance(challengerId);
 
-    const estimatedStake = challengeStakeAmount(myRating, ownerRating, myBalance);
+    const estimatedStake = challengeStakeAmount(
+      { rating: myRating, rd: myRd },
+      { rating: ownerRating, rd: ownerRd },
+      myBalance
+    );
 
     const base = {
       estimatedStake,
@@ -275,7 +281,9 @@ export const initiateBreach = functions.https.onCall(async (data, context) => {
     const ownerSnap = await tx.get(db.collection("users").doc(ownerId));
     const challengerSnap = await tx.get(challengerRef);
     const ownerRating = (ownerSnap.get("rating") as number) ?? 1500;
+    const ownerRd = (ownerSnap.get("rd") as number) ?? 350;
     const challengerRating = (challengerSnap.get("rating") as number) ?? 1500;
+    const challengerRd = (challengerSnap.get("rd") as number) ?? 350;
     const challengerBal = await readCpInTx(tx, challengerId);
 
     // NOTE (design #18, revised): a challenger MAY hold multiple concurrent
@@ -301,10 +309,10 @@ export const initiateBreach = functions.https.onCall(async (data, context) => {
     }
 
     // Breach stake: challenge-up fraction of the CHALLENGER's balance vs the
-    // OWNER's rating. Formula clamps at 40%.
+    // OWNER's rating (Glicko-2, RD-weighted). Formula clamps at 40%.
     const breachStake = challengeStakeAmount(
-      challengerRating,
-      ownerRating,
+      { rating: challengerRating, rd: challengerRd },
+      { rating: ownerRating, rd: ownerRd },
       challengerBal
     );
     if (breachStake <= 0 || challengerBal < breachStake) {
@@ -545,12 +553,14 @@ async function createGauntletGameInTx(
   );
   const defenderSnap = await tx.get(db.collection("users").doc(defenderId));
   const challengerRating = (challengerSnap.get("rating") as number) ?? 1500;
+  const challengerRd = (challengerSnap.get("rd") as number) ?? 350;
   const defenderRating = (defenderSnap.get("rating") as number) ?? 1500;
+  const defenderRd = (defenderSnap.get("rd") as number) ?? 350;
   const defenderBal = await readCpInTx(tx, defenderId);
 
   const normalStake = challengeStakeAmount(
-    defenderRating,
-    challengerRating,
+    { rating: defenderRating, rd: defenderRd },
+    { rating: challengerRating, rd: challengerRd },
     defenderBal
   );
   const stake = Math.floor(normalStake * GAUNTLET_STAKE_DISCOUNT);
@@ -960,11 +970,13 @@ export async function settleConquest(
         );
         const challengerRating =
           (challengerSnap.get("rating") as number) ?? 1500;
+        const challengerRd = (challengerSnap.get("rd") as number) ?? 350;
         const defenderRating = (defenderSnap.get("rating") as number) ?? 1500;
+        const defenderRd = (defenderSnap.get("rd") as number) ?? 350;
         const defenderBal = await readCpInTx(tx, defenderId);
         const normalStake = challengeStakeAmount(
-          defenderRating,
-          challengerRating,
+          { rating: defenderRating, rd: defenderRd },
+          { rating: challengerRating, rd: challengerRd },
           defenderBal
         );
         nextStake = Math.floor(normalStake * GAUNTLET_STAKE_DISCOUNT);
