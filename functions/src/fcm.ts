@@ -3,7 +3,8 @@
  *
  * WHY A TRIGGER (not inline in notify.ts):
  * notify.ts's header anticipated hooking FCM in "after the doc write". But the
- * three push-worthy events (game_ready, breach_initiated, gauntlet_nominated)
+ * three push-worthy events (game_ready, breach_initiated, gauntlet_nominated,
+ * plus challenge_up)
  * are ALL written inside Firestore transactions (notifyTx / notifyManyTx), and
  * you must not send an FCM push inside a transaction — a tx can retry, which
  * would fire duplicate pushes. So instead we react to the COMMITTED fact: a
@@ -45,14 +46,18 @@ import { db } from "./init";
  *   game_ready          a staked game you agreed to is waiting for you to enter.
  *   breach_initiated    your circle is under breach — defend to stop them.
  *   gauntlet_nominated  you've been nominated to defend the gauntlet.
+ *   challenge_up        someone challenged you up — a high-CP-gain opportunity.
  *
- * (Deliberately excluded: stake_offer / challenge_up and all result/info types —
- * they'd flood high-rated players. They remain visible in the bell.)
+ * (Deliberately excluded: stake_offer and all result/info types — they'd flood
+ * high-rated players. They remain visible in the bell. challenge_up is pushed
+ * because it is a time-sensitive, high-value opportunity for the challenged
+ * player; simultaneous challenges tag by stakeId so they stack, not collapse.)
  */
 const PUSH_ALLOWLIST = new Set<string>([
   "game_ready",
   "breach_initiated",
   "gauntlet_nominated",
+  "challenge_up",
 ]);
 
 /**
@@ -181,7 +186,7 @@ export const onNotificationCreated = onDocumentCreated(
           priority: "high",
           notification: {
             // Default channel; client can customize later. Tag dedupes repeats.
-            tag: data.gameId || data.conquestId || type,
+            tag: data.stakeId || data.gameId || data.conquestId || type,
           },
         },
       });
