@@ -501,7 +501,7 @@ class _DismissibleErrorStrip extends StatefulWidget {
   final String message;
   const _DismissibleErrorStrip({required this.message});
   @override
-  State<_DismissibleErrorStrip> createState() => _DismissibleErrorStripState();
+  State<_DismissibleErrorStripState> createState() => _DismissibleErrorStripState();
 }
 
 class _DismissibleErrorStripState extends State<_DismissibleErrorStrip> {
@@ -887,29 +887,11 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _busy = false;
   String? _status;
 
-  // Auto-navigation into active games. A staked/challenge game is created
-  // server-side when the OPPONENT accepts, so the issuer (challenger) has no
-  // action that returns a gameId — without this they'd sit on whatever screen
-  // they were on while their game (and clock) is live. This listener watches
-  // the user's active games and pulls them into the board the moment one
-  // appears, no matter which screen is on top. Works uniformly for the
-  // accepter and the issuer, peer stakes and challenge-ups.
-  // NOTE: auto-navigation into newly-active games is intentionally DISABLED.
-  // The flow is "always tap Enter": the global waiting banner and the
-  // notification center both give every player an explicit Enter/Open button,
-  // so entering a game is always a deliberate tap — predictable and consistent,
-  // never a surprise yank onto a board. `_enterGame` remains for the cases where
-  // WE initiated and should follow our own action (e.g. quick match).
-  String? _currentGameId; // the game whose board is currently on top, if any
+  String? _currentGameId;
 
   @override
   void initState() {
     super.initState();
-    // The AuthGate only builds HomeScreen when a user is signed in, so this is
-    // the right point to register this device for push. Fire-and-forget: it
-    // requests notification permission, registers the FCM token server-side,
-    // and keeps it fresh. Failures are swallowed inside setupFcm (the in-app
-    // bell still works without push).
     setupFcm(_service);
   }
 
@@ -919,13 +901,12 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _enterGame(String gameId) async {
-    if (_currentGameId != null) return; // already on a board
+    if (_currentGameId != null) return;
     _currentGameId = gameId;
     await Navigator.of(context).push(MaterialPageRoute(
       settings: const RouteSettings(name: 'game'),
       builder: (_) => GameScreen(gameId: gameId, service: _service),
     ));
-    // Returned from the board (game over or user backed out).
     if (mounted) _currentGameId = null;
   }
 
@@ -935,12 +916,8 @@ class _HomeScreenState extends State<HomeScreen> {
       _status = 'Finding a game…';
     });
     try {
-      // User is already signed in (the AuthGate guarantees it), so we go
-      // straight to matchmaking — no ensureSignedIn() needed.
       final gameId = await _service.quickMatch();
       if (!mounted) return;
-      // _enterGame guards against double-push via _currentGameId; the active-
-      // games listener won't stack because of the same guard.
       _enterGame(gameId);
     } on FirebaseFunctionsException catch (e) {
       setState(() => _status = 'Error: ${e.message}');
@@ -955,9 +932,12 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final user = _service.currentUser;
     final name = user?.displayName ?? user?.email ?? 'Player';
+    final scheme = Theme.of(context).colorScheme;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Chess Masters'),
+        elevation: 0,
         actions: [
           IconButton(
             tooltip: 'Sign out',
@@ -966,2919 +946,379 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
-      body: Center(
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
         child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Icon(Icons.castle, size: 72),
-            const SizedBox(height: 8),
-            Text('Signed in as $name',
-                style: const TextStyle(fontSize: 14, color: Colors.black54)),
-            const SizedBox(height: 12),
-            // Live CP balance + rating. CP comes from the ledger sum; rating
-            // from the profile. Both update live.
+            // ===== PROFILE HEADER =====
+            Container(
+              margin: const EdgeInsets.only(bottom: 24),
+              child: Row(
+                children: [
+                  // Avatar
+                  Container(
+                    width: 64,
+                    height: 64,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: LinearGradient(
+                        colors: [
+                          scheme.primary,
+                          scheme.secondary,
+                        ],
+                      ),
+                    ),
+                    child: Center(
+                      child: Icon(
+                        Icons.castle,
+                        size: 32,
+                        color: scheme.onPrimary,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  // Name & subtitle
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Chess Masters',
+                          style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Signed in as $name',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: scheme.outline,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            // ===== STATS CARDS =====
             Row(
-              mainAxisSize: MainAxisSize.min,
               children: [
-                StreamBuilder<int>(
-                  stream: _service.myCpBalanceStream(),
-                  builder: (context, snap) {
-                    final cp = snap.data;
-                    return _StatChip(
-                      icon: Icons.toll,
-                      label: cp == null ? 'CP …' : '$cp CP',
-                    );
-                  },
+                // CP Card
+                Expanded(
+                  child: _StatCard(
+                    icon: Icons.toll,
+                    label: 'CP',
+                    child: StreamBuilder<int>(
+                      stream: _service.myCpBalanceStream(),
+                      builder: (context, snap) {
+                        final cp = snap.data;
+                        return Text(
+                          cp == null ? '…' : '${cp ~/ 1}',
+                          style: const TextStyle(
+                            fontSize: 28,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        );
+                      },
+                    ),
+                  ),
                 ),
-                const SizedBox(width: 10),
-                StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-                  stream: _service.myProfileStream(),
-                  builder: (context, snap) {
-                    final data = snap.data?.data();
-                    final rating = (data?['rating'] as num?)?.round();
-                    return _StatChip(
-                      icon: Icons.military_tech,
-                      label: rating == null ? 'Rating …' : 'Rating $rating',
-                    );
-                  },
+                const SizedBox(width: 12),
+                // Rating Card
+                Expanded(
+                  child: _StatCard(
+                    icon: Icons.military_tech,
+                    label: 'RATING',
+                    child: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                      stream: _service.myProfileStream(),
+                      builder: (context, snap) {
+                        final rating = (snap.data?.data()?['rating'] as num?)?.round();
+                        return Text(
+                          rating == null ? '…' : '$rating',
+                          style: const TextStyle(
+                            fontSize: 28,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                // Rank Card
+                Expanded(
+                  child: _StatCard(
+                    icon: Icons.leaderboard,
+                    label: 'RANK',
+                    child: Text(
+                      '—',
+                      style: TextStyle(
+                        fontSize: 28,
+                        fontWeight: FontWeight.w700,
+                        color: scheme.outline,
+                      ),
+                    ),
+                  ),
                 ),
               ],
             ),
-            const SizedBox(height: 24),
-            // Resume an in-progress game (e.g. a staked game created when an
-            // opponent accepted your offer — the issuer has no other way in).
-            StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-              stream: _service.activeGamesStream(),
-              builder: (context, snap) {
-                final docs = snap.data?.docs ?? [];
-                if (docs.isEmpty) return const SizedBox.shrink();
-                final gameId = docs.first.id;
-                return Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: FilledButton.icon(
-                    style: FilledButton.styleFrom(
-                        backgroundColor: Colors.green.shade700),
-                    onPressed: () => Navigator.of(context).push(
-                      MaterialPageRoute(
-                        settings: const RouteSettings(name: 'game'),
-                        builder: (_) =>
-                            GameScreen(gameId: gameId, service: _service),
-                      ),
-                    ),
-                    icon: const Icon(Icons.sports_esports),
-                    label: Text(docs.length > 1
-                        ? 'Resume game (${docs.length})'
-                        : 'Resume game'),
-                  ),
-                );
-              },
-            ),
-            FilledButton.icon(
-              onPressed: _busy ? null : _quickMatch,
-              icon: const Icon(Icons.play_arrow),
-              label: const Text('Quick Match'),
+
+            const SizedBox(height: 32),
+
+            // ===== MENU ITEMS =====
+            _MenuItem(
+              icon: Icons.play_circle_outlined,
+              label: 'Quick Match',
+              subtitle: 'Find a random opponent',
+              onTap: _busy ? null : _quickMatch,
             ),
             const SizedBox(height: 12),
-            OutlinedButton.icon(
-              onPressed: _busy
+            _MenuItem(
+              icon: Icons.groups,
+              label: 'Circles',
+              subtitle: 'Join communities & play friends',
+              onTap: _busy
                   ? null
                   : () => Navigator.of(context).push(MaterialPageRoute(
                         builder: (_) => CirclesScreen(service: _service),
                       )),
-              icon: const Icon(Icons.groups),
-              label: const Text('Circles'),
             ),
             const SizedBox(height: 12),
-            OutlinedButton.icon(
-              onPressed: _busy
+            _MenuItem(
+              icon: Icons.public,
+              label: 'Open Lobby',
+              subtitle: 'Stake CP against strangers',
+              onTap: _busy
                   ? null
                   : () => Navigator.of(context).push(MaterialPageRoute(
                         builder: (_) => LobbyScreen(service: _service),
                       )),
-              icon: const Icon(Icons.public),
-              label: const Text('Open Lobby'),
             ),
             const SizedBox(height: 12),
-            OutlinedButton.icon(
-              onPressed: _busy
+            _MenuItem(
+              icon: Icons.leaderboard,
+              label: 'Leaderboards',
+              subtitle: 'View top players & circles',
+              onTap: _busy
                   ? null
                   : () => Navigator.of(context).push(MaterialPageRoute(
                         builder: (_) => LeaderboardScreen(service: _service),
                       )),
-              icon: const Icon(Icons.leaderboard),
-              label: const Text('Leaderboards'),
             ),
-            const SizedBox(height: 16),
-            if (_busy) const CircularProgressIndicator(),
-            if (_status != null) ...[
-              const SizedBox(height: 12),
-              Text(_status!, textAlign: TextAlign.center),
-            ],
-            const SizedBox(height: 8),
-            const Padding(
-              padding: EdgeInsets.symmetric(horizontal: 32),
-              child: Text(
-                'Tip: launch two emulators (or an emulator + a device) and '
-                'tap Quick Match on both to be paired into one game.',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 12, color: Colors.black54),
-              ),
+            const SizedBox(height: 12),
+            _MenuItem(
+              icon: Icons.chat_bubble_outline,
+              label: 'Chat',
+              subtitle: 'Coming soon',
+              badge: 'soon',
+              onTap: null,
             ),
-          ],
-        ),
-      ),
-    );
-  }
-}
 
-class _StatChip extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  const _StatChip({required this.icon, required this.label});
+            const SizedBox(height: 24),
 
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.indigo.withOpacity(0.08),
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 18, color: Colors.indigo),
-          const SizedBox(width: 6),
-          Text(label,
-              style: const TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.indigo)),
-        ],
-      ),
-    );
-  }
-}
-
-class GameScreen extends StatefulWidget {
-  final String gameId;
-  final GameService service;
-  const GameScreen({super.key, required this.gameId, required this.service});
-
-  @override
-  State<GameScreen> createState() => _GameScreenState();
-}
-
-class _GameScreenState extends State<GameScreen> {
-  // The board is driven directly by the SERVER's FEN string. We keep the
-  // latest authoritative FEN here and hand it to SimpleChessBoard. The widget
-  // never decides legality — it only displays this FEN and reports move intents.
-  String _currentFen =
-      'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
-  bool _sending = false;
-
-  // ---- Local display clock (server stays authoritative) ----
-  Timer? _ticker;          // 1s display tick
-  int _tick = 0;           // increments each second to force clock redraw
-  DateTime? _opponentLowSince; // when the opponent first appeared out of time
-  bool _claimingTimeout = false;
-  bool _finishedHandled = false; // ensures auto-return fires only once
-
-  /// Called from build when the game reaches a terminal `finished` state. Shows
-  /// the result for a few seconds so the player sees the outcome, then returns
-  /// them to wherever they came from (Home/Circle) — so a finished/abandoned
-  /// game never strands the player on a dead board. Fires exactly once.
-  void _handleFinished() {
-    if (_finishedHandled) return;
-    _finishedHandled = true;
-    Future.delayed(const Duration(seconds: 4), () {
-      if (!mounted) return;
-      final nav = Navigator.of(context);
-      if (nav.canPop()) nav.pop();
-    });
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    // The global bell/banner hide themselves while a board is on top via the
-    // NavigatorObserver (gameRouteOnTop) — no per-screen counter to manage here.
-    // Ready-gate: signal presence as soon as this board opens. For a pre-seated
-    // staked/conquest game in `waiting`, this adds us to `ready`; the game
-    // activates (clock starts) only once BOTH players have done so. For casual
-    // games (or already-active games) the server no-ops / rejects cleanly, so we
-    // swallow errors. Readying is sticky — we can leave after this; the game
-    // won't block other play.
-    _markReadyOnce();
-  }
-
-  Future<void> _markReadyOnce() async {
-    try {
-      await widget.service.markReady(widget.gameId);
-    } catch (_) {
-      // Casual games and already-active/finished games throw or no-op here —
-      // harmless. The stream remains the source of truth for what to show.
-    }
-  }
-
-  @override
-  void dispose() {
-    _ticker?.cancel();
-    super.dispose();
-  }
-
-  /// Start/stop a 1-second ticker while the game is active. The ticker only
-  /// drives DISPLAY (counting down the side-to-move's clock visually). If the
-  /// OPPONENT appears to have run out for a few seconds, we ask the SERVER to
-  /// resolve it via claimTimeout — we never decide the result ourselves.
-  void _trackClock(String status, String turn, bool myTurn) {
-    final active = status == 'active';
-    if (active && _ticker == null) {
-      _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
-        if (!mounted) return;
-        setState(() => _tick++);
-        // If it's the OPPONENT's turn and they seem to have flagged, give the
-        // server a moment then ask it to check. (Server is the judge.)
-        if (!myTurn && !_claimingTimeout) {
-          _maybeClaimTimeout();
-        }
-      });
-    } else if (!active && _ticker != null) {
-      _ticker!.cancel();
-      _ticker = null;
-      _opponentLowSince = null;
-    }
-  }
-
-  Future<void> _maybeClaimTimeout() async {
-    // Throttle: only poll the server occasionally, not every tick.
-    _claimingTimeout = true;
-    try {
-      final res = await widget.service.claimTimeout(widget.gameId);
-      // If the server resolved it, the stream will deliver the finished state.
-      // If not, nothing happens — the game continues.
-      if (res['resolved'] != true) {
-        // not resolved; allow another attempt later
-      }
-    } catch (_) {
-      // Ignore — transient; the stream remains the source of truth.
-    } finally {
-      // Re-allow a future claim after a short delay to avoid hammering.
-      Future.delayed(const Duration(seconds: 5), () => _claimingTimeout = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final myUid = widget.service.uid;
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Game'),
-        actions: [
-          IconButton(
-            tooltip: 'Resign',
-            icon: const Icon(Icons.flag),
-            onPressed: () => widget.service.resign(widget.gameId),
-          ),
-        ],
-      ),
-      body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-        stream: widget.service.gameStream(widget.gameId),
-        builder: (context, snap) {
-          if (!snap.hasData || !snap.data!.exists) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          final g = snap.data!.data()!;
-          final status = g['status'] as String;
-          // When the game reaches a terminal state, show the result briefly then
-          // auto-return so the player isn't stranded on a dead board.
-          if (status == 'finished') {
-            _handleFinished();
-          }
-          final fen = g['fen'] as String;
-          final turn = g['turn'] as String; // 'w' | 'b'
-          final whiteId = g['whiteId'] as String?;
-          final blackId = g['blackId'] as String?;
-          final result = g['result'] as String?;
-          final reason = g['resultReason'] as String?;
-          final gameType = g['gameType'] as String?;
-          final contextId = g['contextId'] as String?;
-
-          // Clock fields (server-authoritative; we only DISPLAY them).
-          final whiteMs = (g['whiteMs'] as num?)?.toInt() ?? 0;
-          final blackMs = (g['blackMs'] as num?)?.toInt() ?? 0;
-
-          // Which colour am I? Determines board orientation and move rights.
-          final iAmWhite = myUid == whiteId;
-          final iAmBlack = myUid == blackId;
-          final myTurn = (turn == 'w' && iAmWhite) || (turn == 'b' && iAmBlack);
-
-          // Track the SERVER's FEN as the source of truth for the board.
-          _currentFen = fen;
-
-          // Keep the local display ticker aware of the active game so it can
-          // count down the side-to-move's clock for display and, if the
-          // OPPONENT runs out / abandons, prompt the server to resolve it.
-          _trackClock(status, turn, myTurn);
-
-          // Player-type gate: a side is "human" (movable) only if it's MY
-          // colour AND it's my turn AND the game is active and I'm not mid-send.
-          // Everything else is "computer" (locked). The server also enforces
-          // turn/legality — this is the client-side belt-and-braces.
-          final canMove = status == 'active' && myTurn && !_sending;
-          final whiteType = (iAmWhite && canMove)
-              ? PlayerType.human
-              : PlayerType.computer;
-          final blackType = (iAmBlack && canMove)
-              ? PlayerType.human
-              : PlayerType.computer;
-
-          return Column(
-            children: [
-              _ClockBar(
-                status: status,
-                turn: turn,
-                whiteMs: whiteMs,
-                blackMs: blackMs,
-                iAmWhite: iAmWhite,
-                tick: _tick, // forces recompute each second
-              ),
-              _StatusBar(
-                status: status,
-                myTurn: myTurn,
-                iAmWhite: iAmWhite,
-                iAmBlack: iAmBlack,
-                result: result,
-                reason: reason,
-              ),
-              // Ready-gate: while the pre-seated game is `waiting`, the board is
-              // locked and clocks are frozen (handled by canMove/_trackClock).
-              // Show WHY — we're waiting for the other player to arrive. The
-              // clock only starts once both have opened the board (markReady).
-              if (status == 'waiting')
-                Builder(builder: (context) {
-                  final ready =
-                      (g['ready'] as List?)?.cast<String>() ?? const <String>[];
-                  final iAmReady = myUid != null && ready.contains(myUid);
-                  final scheme = Theme.of(context).colorScheme;
-                  return Container(
-                    width: double.infinity,
-                    color: scheme.secondaryContainer,
-                    padding: const EdgeInsets.all(12),
-                    child: Row(
-                      children: [
-                        SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: scheme.onSecondaryContainer,
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Text(
-                            iAmReady
-                                ? 'Waiting for your opponent to join… The clock '
-                                    'starts when both of you are here. You can '
-                                    'leave and come back — your spot is held.'
-                                : 'Joining…',
-                            style: TextStyle(
-                                color: scheme.onSecondaryContainer,
-                                fontSize: 13),
-                          ),
-                        ),
-                      ],
-                    ),
-                  );
-                }),
-              // Slice 4: when a finished BREACH/GAUNTLET game's conquest has a
-              // next game ready (or a terminal outcome), show a prompt here so
-              // the player explicitly enters the next game. This drives the
-              // whole chain (breach → gauntlet 1 → 2 → 3 → terminal) reliably
-              // from the board, independent of HomeScreen's auto-nav.
-              if (status == 'finished' &&
-                  (gameType == 'gauntlet' || gameType == 'breach') &&
-                  contextId != null)
-                _ConquestNextStep(
-                  service: widget.service,
-                  conquestId: contextId,
-                  finishedGameId: widget.gameId,
-                ),
-              Expanded(
-                child: Center(
-                  child: SimpleChessBoard(
-                    fen: _currentFen,
-                    blackSideAtBottom: iAmBlack,
-                    whitePlayerType: whiteType,
-                    blackPlayerType: blackType,
-                    engineThinking: false,
-                    onMove: ({required ShortMove move}) =>
-                        _onLocalMove(move),
-                    onPromote: () async => PieceType.queen,
-                    onPromotionCommited: ({
-                      required ShortMove moveDone,
-                      required PieceType pieceType,
-                    }) {
-                      // Promotion is sent to the server as part of the move;
-                      // nothing to update locally (server returns new FEN).
-                    },
-                    // Required by the widget; we don't need custom tap
-                    // behaviour (moves go through onMove), so this is a no-op.
-                    onTap: ({required String cellCoordinate}) {},
-                    // Required: which squares to tint. We highlight none.
-                    cellHighlights: const <String, Color>{},
-                    chessBoardColors: ChessBoardColors()
-                      ..lastMoveArrowColor = Colors.blueAccent,
-                  ),
-                ),
-              ),
-              if (_sending)
-                const Padding(
-                  padding: EdgeInsets.all(8),
-                  child: LinearProgressIndicator(),
-                ),
-            ],
-          );
-        },
-      ),
-    );
-  }
-
-  /// The board reported a tentative move (ShortMove from simple_chess_board).
-  /// We DO NOT trust it as truth — we send from/to (+promotion) to the server
-  /// and let the authoritative FEN come back through the stream. If the server
-  /// rejects it, the stream simply keeps the last good FEN (the board re-renders
-  /// from _currentFen, which we never advanced locally).
-  Future<void> _onLocalMove(ShortMove move) async {
-    if (_sending) return;
-    final from = move.from;
-    final to = move.to;
-    // simple_chess_board's promotion is a PieceType?; the server expects a
-    // single-char string ('q','r','b','n') or null.
-    String? promo;
-    switch (move.promotion) {
-      case PieceType.queen:
-        promo = 'q';
-        break;
-      case PieceType.rook:
-        promo = 'r';
-        break;
-      case PieceType.bishop:
-        promo = 'b';
-        break;
-      case PieceType.knight:
-        promo = 'n';
-        break;
-      default:
-        promo = null;
-    }
-
-    setState(() => _sending = true);
-    try {
-      await widget.service.makeMove(
-        gameId: widget.gameId,
-        from: from,
-        to: to,
-        promotion: promo,
-      );
-      // Success: the stream will deliver the new authoritative FEN, which
-      // re-renders the board. We never advanced the board locally.
-    } on FirebaseFunctionsException catch (e) {
-      // Rejected by server — the board stays on the last good FEN (_currentFen
-      // was not changed locally), so nothing to roll back. Just inform the user.
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Move rejected: ${e.message}')),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _sending = false);
-    }
-  }
-}
-
-/// Shown under the board on a FINISHED breach/gauntlet game. Watches the
-/// conquest and tells the player what's next:
-///   - a new game is ready and I'm in it  → "Enter next game" (pushReplacement)
-///   - breach won, Gauntlet not yet started → "Awaiting the Gauntlet…"
-///   - terminal (won / ejected / breach failed) → outcome message
-/// This drives the conquest chain reliably from the board itself, so each
-/// player explicitly enters each game (no dependency on HomeScreen auto-nav).
-class _ConquestNextStep extends StatelessWidget {
-  final GameService service;
-  final String conquestId;
-  final String finishedGameId;
-  const _ConquestNextStep({
-    required this.service,
-    required this.conquestId,
-    required this.finishedGameId,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    final myUid = service.uid;
-
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: service.conquestStream(conquestId),
-      builder: (context, snap) {
-        final q = snap.data?.data();
-        if (q == null) return const SizedBox.shrink();
-
-        final status = q['status'] as String?;
-        final gauntlet = q['gauntlet'] as Map<String, dynamic>?;
-        final currentGameId = gauntlet?['currentGameId'] as String?;
-
-        // Terminal outcomes.
-        if (status == 'challenger_won') {
-          return _banner(
-            scheme.primaryContainer,
-            scheme.onPrimaryContainer,
-            Icons.emoji_events,
-            'Conquest won — full membership granted!',
-          );
-        }
-        if (status == 'challenger_ejected') {
-          return _banner(
-            scheme.errorContainer,
-            scheme.onErrorContainer,
-            Icons.block,
-            'Ejected — the Gauntlet was held.',
-          );
-        }
-        if (status == 'breach_failed') {
-          return _banner(
-            scheme.errorContainer,
-            scheme.onErrorContainer,
-            Icons.block,
-            'Breach failed.',
-          );
-        }
-
-        // Breach won by the challenger; awaiting the owner's Gauntlet
-        // nomination. The copy must be role-aware: the challenger WON the
-        // breach, but the circle owner / breach defender LOST it and now must
-        // act — telling them "Breach won" reads as if they won. Branch on the
-        // viewer's role so each side sees the truth from their perspective.
-        if (status == 'gauntlet_pending') {
-          final challengerId = q['challengerId'] as String?;
-          final ownerId = q['ownerId'] as String?;
-          final defenderId =
-              (q['breachDefenderId'] ?? q['defenderId']) as String?;
-          final String pendingMsg;
-          if (myUid != null && myUid == challengerId) {
-            // The winner of the breach.
-            pendingMsg = 'Breach won — awaiting the Gauntlet defender.';
-          } else if (myUid != null && myUid == ownerId) {
-            // The owner must nominate a Gauntlet defender.
-            pendingMsg =
-                'Your wall was breached — nominate a Gauntlet defender.';
-          } else if (myUid != null && myUid == defenderId) {
-            // The breach defender who lost (and isn't the owner).
-            pendingMsg =
-                'Your wall was breached — the Gauntlet will defend the circle.';
-          } else {
-            // Any other circle member / observer.
-            pendingMsg = 'Wall breached — awaiting a Gauntlet defender.';
-          }
-          return _banner(
-            scheme.tertiaryContainer,
-            scheme.onTertiaryContainer,
-            Icons.hourglass_top,
-            pendingMsg,
-          );
-        }
-
-        // A next game is live. Offer to enter it IF I'm a player in it and it
-        // isn't the game I just finished.
-        if (status == 'gauntlet_active' &&
-            currentGameId != null &&
-            currentGameId != finishedGameId) {
-          return FutureBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-            future: service.gameOnce(currentGameId),
-            builder: (context, gSnap) {
-              final game = gSnap.data?.data();
-              if (game == null) return const SizedBox.shrink();
-              final players =
-                  (game['players'] as List?)?.cast<String>() ?? <String>[];
-              if (myUid == null || !players.contains(myUid)) {
-                // I'm not in the next game (e.g. I was the breach defender, not
-                // the Gauntlet defender). Just show series state.
-                final cw = (gauntlet?['challengerWins'] as num?)?.toInt() ?? 0;
-                final dw = (gauntlet?['defenderWins'] as num?)?.toInt() ?? 0;
-                return _banner(
-                  scheme.secondaryContainer,
-                  scheme.onSecondaryContainer,
-                  Icons.sports_kabaddi,
-                  'Gauntlet in progress — challenger $cw : $dw defender.',
-                );
-              }
-              final cw = (gauntlet?['challengerWins'] as num?)?.toInt() ?? 0;
-              final dw = (gauntlet?['defenderWins'] as num?)?.toInt() ?? 0;
-              return Container(
-                width: double.infinity,
-                color: scheme.tertiaryContainer,
-                padding: const EdgeInsets.all(12),
+            // Status indicator
+            if (_busy)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 12),
                 child: Row(
                   children: [
-                    Icon(Icons.sports_kabaddi,
-                        color: scheme.onTertiaryContainer),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        'Next Gauntlet game is ready (challenger $cw : $dw '
-                        'defender).',
-                        style: TextStyle(
-                            color: scheme.onTertiaryContainer, fontSize: 13),
-                      ),
+                    const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
                     ),
-                    const SizedBox(width: 8),
-                    FilledButton(
-                      onPressed: () {
-                        // Replace this finished board with the next game.
-                        Navigator.of(context).pushReplacement(
-                          MaterialPageRoute(
-                            settings: const RouteSettings(name: 'game'),
-                            builder: (_) => GameScreen(
-                              gameId: currentGameId,
-                              service: service,
-                            ),
-                          ),
-                        );
-                      },
-                      child: const Text('Enter next game'),
+                    const SizedBox(width: 12),
+                    Text(
+                      _status ?? 'Loading…',
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: scheme.outline,
+                      ),
                     ),
                   ],
                 ),
-              );
-            },
-          );
-        }
-
-        return const SizedBox.shrink();
-      },
+              ),
+          ],
+        ),
+      ),
     );
   }
+}
 
-  Widget _banner(Color bg, Color fg, IconData icon, String text) {
+/// Individual stat card widget
+class _StatCard extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Widget child;
+
+  const _StatCard({
+    required this.icon,
+    required this.label,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+
     return Container(
-      width: double.infinity,
-      color: bg,
-      padding: const EdgeInsets.all(12),
-      child: Row(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainer,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: scheme.outlineVariant,
+          width: 1,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(icon, color: fg),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(text, style: TextStyle(color: fg, fontSize: 13)),
+          Row(
+            children: [
+              Icon(icon, size: 18, color: scheme.primary),
+              const SizedBox(width: 6),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: scheme.outline,
+                  letterSpacing: 0.5,
+                ),
+              ),
+            ],
           ),
+          const SizedBox(height: 8),
+          child,
         ],
       ),
     );
   }
 }
 
-class _StatusBar extends StatelessWidget {
-  final String status;
-  final bool myTurn;
-  final bool iAmWhite;
-  final bool iAmBlack;
-  final String? result;
-  final String? reason;
+/// Menu item tile
+class _MenuItem extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String subtitle;
+  final String? badge;
+  final VoidCallback? onTap;
 
-  const _StatusBar({
-    required this.status,
-    required this.myTurn,
-    required this.iAmWhite,
-    required this.iAmBlack,
-    required this.result,
-    required this.reason,
+  const _MenuItem({
+    required this.icon,
+    required this.label,
+    required this.subtitle,
+    this.badge,
+    this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    String text;
-    if (status == 'waiting') {
-      text = 'Waiting for an opponent to join…';
-    } else if (status == 'finished') {
-      final iWon = (result == 'white' && iAmWhite) ||
-          (result == 'black' && iAmBlack);
-      if (result == 'draw') {
-        text = 'Draw (${reason ?? ''})';
-      } else {
-        text = iWon ? 'You won (${reason ?? ''})' : 'You lost (${reason ?? ''})';
-      }
-    } else {
-      final colour = iAmWhite ? 'White' : (iAmBlack ? 'Black' : 'Spectator');
-      text = myTurn ? 'Your move ($colour)' : 'Opponent\'s move ($colour)';
-    }
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(12),
-      color: Theme.of(context).colorScheme.secondaryContainer,
-      child: Text(text,
-          textAlign: TextAlign.center,
-          style: const TextStyle(fontWeight: FontWeight.w600)),
-    );
-  }
-}
+    final scheme = Theme.of(context).colorScheme;
+    final isDisabled = onTap == null;
 
-/// Displays both players' clocks. Server-authoritative times come from the
-/// game doc (whiteMs/blackMs); for the side to move we count DOWN locally each
-/// second purely for display. The server remains the judge of flag-fall —
-/// this widget never decides a result.
-class _ClockBar extends StatelessWidget {
-  final String status;
-  final String turn; // 'w' | 'b'
-  final int whiteMs;
-  final int blackMs;
-  final bool iAmWhite;
-  final int tick; // changes each second to force a rebuild
-
-  const _ClockBar({
-    required this.status,
-    required this.turn,
-    required this.whiteMs,
-    required this.blackMs,
-    required this.iAmWhite,
-    required this.tick,
-  });
-
-  String _fmt(int ms) {
-    if (ms < 0) ms = 0;
-    final totalSec = ms ~/ 1000;
-    final m = totalSec ~/ 60;
-    final s = totalSec % 60;
-    return '$m:${s.toString().padLeft(2, '0')}';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    // For display only: show the stored times. (A more advanced version would
-    // subtract local elapsed time for the side to move; kept simple here since
-    // the stream refreshes on every move and the server is authoritative.)
-    final myMs = iAmWhite ? whiteMs : blackMs;
-    final oppMs = iAmWhite ? blackMs : whiteMs;
-    final myColourToMove = (turn == 'w' && iAmWhite) || (turn == 'b' && !iAmWhite);
-
-    Widget clock(String label, int ms, bool isActive) {
-      return Column(
-        children: [
-          Text(label, style: const TextStyle(fontSize: 12, color: Colors.black54)),
-          Text(
-            _fmt(ms),
-            style: TextStyle(
-              fontSize: 26,
-              fontWeight: FontWeight.bold,
-              fontFeatures: const [FontFeature.tabularFigures()],
-              color: isActive && status == 'active'
-                  ? Theme.of(context).colorScheme.primary
-                  : Colors.black87,
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: isDisabled ? null : onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          decoration: BoxDecoration(
+            color: isDisabled
+                ? scheme.surfaceContainerLowest.withOpacity(0.5)
+                : scheme.surfaceContainer,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: scheme.outlineVariant.withOpacity(isDisabled ? 0.3 : 1),
+              width: 1,
             ),
           ),
-        ],
-      );
-    }
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          clock('You', myMs, myColourToMove),
-          clock('Opponent', oppMs, !myColourToMove),
-        ],
-      ),
-    );
-  }
-}
-
-// =============================================================================
-// SLICE 2c: Circles
-// =============================================================================
-
-/// Lists the circles the user belongs to, distinguishes the one they own,
-/// and lets them create a circle (if they don't already own one).
-class CirclesScreen extends StatelessWidget {
-  final GameService service;
-  const CirclesScreen({super.key, required this.service});
-
-  Future<void> _createCircle(BuildContext context) async {
-    final controller = TextEditingController();
-    final name = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Create a circle'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          maxLength: 40,
-          decoration: const InputDecoration(
-            hintText: 'Circle name',
-            border: OutlineInputBorder(),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text('Create'),
-          ),
-        ],
-      ),
-    );
-    if (name == null || name.isEmpty) return;
-    try {
-      await service.createCircle(name);
-      if (context.mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Created "$name"')));
-      }
-    } on FirebaseFunctionsException catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.message ?? 'Failed')));
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Circles'),
-        actions: [
-          IconButton(
-            tooltip: 'Search circles',
-            icon: const Icon(Icons.search),
-            onPressed: () => Navigator.of(context).push(MaterialPageRoute(
-              builder: (_) => SearchCirclesScreen(service: service),
-            )),
-          ),
-        ],
-      ),
-      body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-        stream: service.myProfileStream(),
-        builder: (context, profileSnap) {
-          final ownedCircleId =
-              profileSnap.data?.data()?['ownedCircleId'] as String?;
-          return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-            stream: service.myCirclesStream(),
-            builder: (context, circlesSnap) {
-              if (circlesSnap.connectionState == ConnectionState.waiting) {
-                return const Center(child: CircularProgressIndicator());
-              }
-              final docs = circlesSnap.data?.docs ?? [];
-              return Column(
-                children: [
-                  Expanded(
-                    child: docs.isEmpty
-                        ? const Center(
-                            child: Padding(
-                              padding: EdgeInsets.all(32),
-                              child: Text(
-                                "You're not in any circles yet.\n"
-                                'Create one below, or search to join (coming soon).',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(color: Colors.black54),
-                              ),
-                            ),
-                          )
-                        : ListView.builder(
-                            itemCount: docs.length,
-                            itemBuilder: (context, i) {
-                              final c = docs[i].data();
-                              final id = docs[i].id;
-                              final isOwner = id == ownedCircleId;
-                              final count = (c['memberCount'] ?? 0) as int;
-                              return ListTile(
-                                leading: const Icon(Icons.groups),
-                                title: Text(c['name'] as String? ?? 'Circle'),
-                                subtitle: Text(
-                                    '$count member${count == 1 ? '' : 's'}'),
-                                trailing: isOwner
-                                    ? const Chip(
-                                        label: Text('Owner'),
-                                        visualDensity: VisualDensity.compact,
-                                      )
-                                    : null,
-                                onTap: () =>
-                                    Navigator.of(context).push(MaterialPageRoute(
-                                  builder: (_) => CircleDetailScreen(
-                                    service: service,
-                                    circleId: id,
-                                  ),
-                                )),
-                              );
-                            },
-                          ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: ownedCircleId == null
-                        ? FilledButton.icon(
-                            onPressed: () => _createCircle(context),
-                            icon: const Icon(Icons.add),
-                            label: const Text('Create a circle'),
-                          )
-                        : const Text(
-                            'You already own a circle (one per account).',
-                            style: TextStyle(color: Colors.black54),
-                          ),
-                  ),
-                ],
-              );
-            },
-          );
-        },
-      ),
-    );
-  }
-}
-
-/// Shows a circle's members sorted by rating (top = crown holder), and
-/// lets a member leave or the owner delete.
-class CircleDetailScreen extends StatelessWidget {
-  final GameService service;
-  final String circleId;
-  const CircleDetailScreen({
-    super.key,
-    required this.service,
-    required this.circleId,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final myUid = service.uid;
-    return Scaffold(
-      appBar: AppBar(title: const Text('Circle')),
-      body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-        stream: service.circleStream(circleId),
-        builder: (context, snap) {
-          if (snap.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          final data = snap.data?.data();
-          if (data == null) {
-            return const Center(child: Text('This circle no longer exists.'));
-          }
-          final name = data['name'] as String? ?? 'Circle';
-          final ownerId = data['ownerId'] as String?;
-          final members =
-              (data['members'] as List?)?.cast<String>() ?? <String>[];
-          final isOwner = myUid == ownerId;
-
-          return FutureBuilder<List<Map<String, dynamic>>>(
-            future: service.fetchProfiles(members),
-            builder: (context, profSnap) {
-              if (!profSnap.hasData) {
-                return const Center(child: CircularProgressIndicator());
-              }
-              final profiles = [...profSnap.data!];
-              // Crown order (design §10): highest-rated holds the crown.
-              // Tie-breakers for equal ratings (so the crown is stable, not
-              // arbitrary): a more *established* 1500 outranks a fresh one.
-              //   1) higher rating
-              //   2) lower RD (less uncertain = more proven)
-              //   3) more games played
-              //   4) uid (final deterministic fallback)
-              num n(Map<String, dynamic> p, String k, num fallback) =>
-                  (p[k] ?? fallback) as num;
-              profiles.sort((a, b) {
-                final byRating = n(b, 'rating', 0).compareTo(n(a, 'rating', 0));
-                if (byRating != 0) return byRating;
-                // lower RD ranks higher → compare a vs b (ascending)
-                final byRd = n(a, 'rd', 350).compareTo(n(b, 'rd', 350));
-                if (byRd != 0) return byRd;
-                final byGames =
-                    n(b, 'gamesPlayed', 0).compareTo(n(a, 'gamesPlayed', 0));
-                if (byGames != 0) return byGames;
-                return (a['uid'] as String? ?? '')
-                    .compareTo(b['uid'] as String? ?? '');
-              });
-
-              // My own position in the ranked list, AND my own rating. Challenge-up
-              // is only valid against a player whose RATING is strictly higher than
-              // mine (design §: the lower-rated player challenges up for a rating
-              // climb). We gate on the actual rating comparison below — not list
-              // position — because equal-rating players can sort above me on the
-              // tiebreak (gamesPlayed/uid) yet are NOT valid challenge-up targets.
-              // If I'm not found (shouldn't happen for a member), default so no
-              // Challenge buttons show.
-              final myIndex = profiles.indexWhere((p) => p['uid'] == myUid);
-              final myRating = myIndex < 0
-                  ? double.infinity // not found → no one is "higher", hide all
-                  : ((profiles[myIndex]['rating'] ?? 1500) as num).toDouble();
-
-              return Column(
-                children: [
-                  Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(name,
-                            style: const TextStyle(
-                                fontSize: 22, fontWeight: FontWeight.bold)),
-                        const SizedBox(height: 4),
-                        Text('${members.length} member'
-                            '${members.length == 1 ? '' : 's'}',
-                            style: const TextStyle(color: Colors.black54)),
-                      ],
-                    ),
-                  ),
-                  // Slice 4: shows a Defend call-to-action when this circle is
-                  // under an active breach (renders nothing otherwise).
-                  _BreachDefendBanner(service: service, circleId: circleId),
-                  // Slice 4: owner-only nominate prompt when a breach was won
-                  // and the Gauntlet awaits a champion (renders nothing else).
-                  _GauntletNominateBanner(
-                    service: service,
-                    circleId: circleId,
-                    ownerId: ownerId ?? '',
-                    members: members,
-                  ),
-                  // Slice 4: live Gauntlet series score while one is active.
-                  _GauntletProgressBanner(
-                      service: service, circleId: circleId),
-                  const Divider(height: 1),
-                  Expanded(
-                    child: ListView.builder(
-                      itemCount: profiles.length,
-                      itemBuilder: (context, i) {
-                        final p = profiles[i];
-                        final isCrown = i == 0; // highest-rated holds the crown
-                        final isThisOwner = p['uid'] == ownerId;
-                        final rating = (p['rating'] ?? 1500).round();
-                        final memberUid = p['uid'] as String?;
-                        final isMe = memberUid == myUid;
-                        return ListTile(
-                          leading: CircleAvatar(
-                            child: Text('${i + 1}'),
-                          ),
-                          title: Row(
-                            children: [
-                              Flexible(
-                                child: Text(
-                                  p['displayName'] as String? ?? 'Player',
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                              if (isCrown) ...[
-                                const SizedBox(width: 6),
-                                const Icon(Icons.emoji_events,
-                                    size: 18, color: Colors.amber),
-                              ],
-                            ],
-                          ),
-                          subtitle: Text(isThisOwner ? 'Owner' : ''),
-                          trailing: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text('$rating',
-                                  style: const TextStyle(
-                                      fontWeight: FontWeight.bold)),
-                              if (!isMe && memberUid != null) ...[
-                                const SizedBox(width: 8),
-                                OutlinedButton(
-                                  style: OutlinedButton.styleFrom(
-                                    padding: const EdgeInsets.symmetric(
-                                        horizontal: 10),
-                                    visualDensity: VisualDensity.compact,
-                                  ),
-                                  onPressed: () => _showStakeDialog(
-                                    context,
-                                    service,
-                                    opponentId: memberUid,
-                                    opponentName:
-                                        p['displayName'] as String? ?? 'Player',
-                                    circleId: circleId,
-                                  ),
-                                  child: const Text('Stake'),
-                                ),
-                                const SizedBox(width: 4),
-                                // Challenge-up only targets a player whose RATING
-                                // is strictly higher than mine (a shot at a rating
-                                // climb against a stronger player). Gate on the
-                                // actual rating, not list position, so equal-rated
-                                // members (who can sort above me on a tiebreak)
-                                // don't get an invalid Challenge button.
-                                if (((p['rating'] ?? 1500) as num).toDouble() >
-                                    myRating)
-                                  OutlinedButton(
-                                    style: OutlinedButton.styleFrom(
-                                      padding: const EdgeInsets.symmetric(
-                                          horizontal: 10),
-                                      visualDensity: VisualDensity.compact,
-                                      foregroundColor: Colors.deepOrange,
-                                    ),
-                                    onPressed: () => _showChallengeDialog(
-                                      context,
-                                      service,
-                                      opponentId: memberUid,
-                                      opponentName:
-                                          p['displayName'] as String? ?? 'Player',
-                                      circleId: circleId,
-                                    ),
-                                    child: const Text('Challenge'),
-                                  ),
-                              ],
-                            ],
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                  // Owner-only: pending join requests to approve/reject.
-                  if (isOwner)
-                    _PendingRequests(
-                      service: service,
-                      circleId: circleId,
-                    ),
-                  // Stake offers made to me (any member) — accept/decline.
-                  _IncomingStakes(service: service),
-                  // My own pending offers — cancel (refunds escrowed CP).
-                  _OutgoingStakes(service: service),
-                  const Divider(height: 1),
-                  Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: isOwner
-                        ? OutlinedButton.icon(
-                            style: OutlinedButton.styleFrom(
-                                foregroundColor: Colors.red),
-                            icon: const Icon(Icons.delete_outline),
-                            label: const Text('Delete circle'),
-                            onPressed: () async {
-                              final ok = await _confirm(context,
-                                  'Delete "$name"? This cannot be undone.');
-                              if (!ok) return;
-                              try {
-                                await service.deleteCircle(circleId);
-                                if (context.mounted) Navigator.of(context).pop();
-                              } on FirebaseFunctionsException catch (e) {
-                                if (context.mounted) {
-                                  ScaffoldMessenger.of(context).showSnackBar(
-                                      SnackBar(
-                                          content: Text(e.message ?? 'Failed')));
-                                }
-                              }
-                            },
-                          )
-                        : OutlinedButton.icon(
-                            icon: const Icon(Icons.exit_to_app),
-                            label: const Text('Leave circle'),
-                            onPressed: () async {
-                              final ok = await _confirm(
-                                  context, 'Leave "$name"?');
-                              if (!ok) return;
-                              try {
-                                await service.leaveCircle(circleId);
-                                if (context.mounted) Navigator.of(context).pop();
-                              } on FirebaseFunctionsException catch (e) {
-                                if (context.mounted) {
-                                  ScaffoldMessenger.of(context).showSnackBar(
-                                      SnackBar(
-                                          content: Text(e.message ?? 'Failed')));
-                                }
-                              }
-                            },
-                          ),
-                  ),
-                ],
-              );
-            },
-          );
-        },
-      ),
-    );
-  }
-
-  Future<bool> _confirm(BuildContext context, String message) async {
-    final result = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        content: Text(message),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Confirm')),
-        ],
-      ),
-    );
-    return result ?? false;
-  }
-}
-
-// =============================================================================
-// SLICE 4: Conquest — breach UI (challenger screen + defend banner)
-// =============================================================================
-
-class ChallengerCircleScreen extends StatefulWidget {
-  final GameService service;
-  final String circleId;
-  final String circleName;
-  const ChallengerCircleScreen({
-    super.key,
-    required this.service,
-    required this.circleId,
-    required this.circleName,
-  });
-
-  @override
-  State<ChallengerCircleScreen> createState() => _ChallengerCircleScreenState();
-}
-
-class _ChallengerCircleScreenState extends State<ChallengerCircleScreen> {
-  Map<String, dynamic>? _elig; // server eligibility result (authoritative)
-  bool _loading = true;
-  String? _loadError;
-  bool _mounting = false; // breach call in flight
-
-  @override
-  void initState() {
-    super.initState();
-    _loadEligibility();
-  }
-
-  Future<void> _loadEligibility() async {
-    setState(() {
-      _loading = true;
-      _loadError = null;
-    });
-    try {
-      final e = await widget.service.getBreachEligibility(widget.circleId);
-      if (mounted) {
-        setState(() {
-          _elig = e;
-          _loading = false;
-        });
-      }
-    } on FirebaseFunctionsException catch (e) {
-      if (mounted) {
-        setState(() {
-          _loadError = e.message ?? 'Could not check eligibility.';
-          _loading = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _mountBreach() async {
-    setState(() => _mounting = true);
-    try {
-      final conquestId =
-          await widget.service.initiateBreach(widget.circleId);
-      if (!mounted) return;
-      // Breach mounted: pop back and confirm. (The challenger watches their
-      // conquest via myBreachesStream; a dedicated conquest screen lands with
-      // the Gauntlet commit.)
-      Navigator.of(context).pop();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Breach mounted on ${widget.circleName}. '
-            'Waiting for a defender…')),
-      );
-      // conquestId intentionally unused for now (no conquest screen yet).
-      // ignore: unused_local_variable
-      final _ = conquestId;
-    } on FirebaseFunctionsException catch (e) {
-      if (mounted) {
-        setState(() => _mounting = false);
-        // A lost race (e.g. circle_under_breach) lands here — re-check so the
-        // button reflects the new reality instead of staying enabled.
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(e.message ?? 'Breach failed.')),
-        );
-        _loadEligibility();
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Scaffold(
-      appBar: AppBar(title: const Text('Breach circle')),
-      body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-        stream: widget.service.circleStream(widget.circleId),
-        builder: (context, snap) {
-          final data = snap.data?.data();
-          if (snap.connectionState == ConnectionState.waiting &&
-              data == null) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          if (data == null) {
-            return const Center(child: Text('This circle no longer exists.'));
-          }
-          final name = data['name'] as String? ?? widget.circleName;
-          final members =
-              (data['members'] as List?)?.cast<String>() ?? <String>[];
-
-          // Authoritative numbers from getBreachEligibility once it returns.
-          final e = _elig;
-          final ownerRating = e?['ownerRating'] as int?;
-          final serverStake = e?['estimatedStake'] as int?;
-          final eligible = e?['eligible'] as bool? ?? false;
-          final reason = e?['reason'] as String?;
-          final cooldownDays = e?['cooldownDaysLeft'] as int?;
-
-          return ListView(
-            padding: const EdgeInsets.all(16),
-            children: [
-              Text(name,
-                  style: const TextStyle(
-                      fontSize: 22, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 4),
-              Text('${members.length} member'
-                  '${members.length == 1 ? '' : 's'}'
-                  '${ownerRating != null ? '  ·  owner rating $ownerRating' : ''}',
-                  style: const TextStyle(color: Colors.black54)),
-              const SizedBox(height: 20),
-
-              // ---- Stake preview ----
-              Card(
-                color: scheme.secondaryContainer,
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text('Breach stake',
-                          style: TextStyle(fontWeight: FontWeight.bold)),
-                      const SizedBox(height: 6),
-                      if (_loading)
-                        const Text('Estimating…',
-                            style: TextStyle(fontSize: 13))
-                      else
-                        Text(
-                          serverStake != null
-                              ? '$serverStake CP'
-                              : 'Unavailable',
-                          style: const TextStyle(
-                              fontSize: 24, fontWeight: FontWeight.bold),
-                        ),
-                      const SizedBox(height: 6),
-                      const Text(
-                        'You stake this to mount the breach. Win the defense '
-                        'game and it is refunded; lose or draw and it goes to '
-                        'the defender.',
-                        style: TextStyle(fontSize: 13, color: Colors.black54),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 16),
-
-              // ---- Prize / risk explainer ----
-              const Text('How a breach works',
-                  style: TextStyle(fontWeight: FontWeight.bold)),
-              const SizedBox(height: 6),
-              const Text(
-                'Win one defense game to enter a best-of-3 Gauntlet for full '
-                'membership. A draw counts as a loss — you must win. Lose or '
-                'draw the defense and your stake goes to the defender.',
-                style: TextStyle(fontSize: 13, color: Colors.black54),
-              ),
-              const SizedBox(height: 24),
-
-              // ---- Breach button (eligibility-driven) ----
-              if (_loadError != null) ...[
-                Text(_loadError!,
-                    style: const TextStyle(color: Colors.red, fontSize: 13)),
-                const SizedBox(height: 8),
-                OutlinedButton(
-                  onPressed: _loadEligibility,
-                  child: const Text('Retry'),
-                ),
-              ] else
-                FilledButton.icon(
-                  style: FilledButton.styleFrom(
-                      backgroundColor: Colors.deepOrange),
-                  icon: _mounting
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 2, color: Colors.white))
-                      : const Icon(Icons.flag),
-                  label: Text(_loading
-                      ? 'Checking…'
-                      : (eligible ? 'Breach this circle' : 'Cannot breach')),
-                  onPressed: (_loading || _mounting || !eligible)
-                      ? null
-                      : () async {
-                          final ok = await _confirmBreach(
-                              context, name, serverStake);
-                          if (ok) _mountBreach();
-                        },
-                ),
-              if (!_loading && !eligible && reason != null) ...[
-                const SizedBox(height: 10),
-                Text(
-                  _breachReasonText(reason, cooldownDays),
-                  style: const TextStyle(fontSize: 13, color: Colors.black54),
-                ),
-              ],
-            ],
-          );
-        },
-      ),
-    );
-  }
-
-  Future<bool> _confirmBreach(
-      BuildContext context, String name, int? stake) async {
-    final result = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('Breach "$name"?'),
-        content: Text(
-          stake != null
-              ? 'This locks $stake CP. Win the defense game to get it back and '
-                'enter the Gauntlet; lose or draw and it goes to the defender.'
-              : 'This locks your breach stake. Win the defense game to get it '
-                'back; lose or draw and it goes to the defender.',
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              style: FilledButton.styleFrom(backgroundColor: Colors.deepOrange),
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Breach')),
-        ],
-      ),
-    );
-    return result ?? false;
-  }
-}
-
-/// Friendly text for a getBreachEligibility `reason` code.
-String _breachReasonText(String reason, int? cooldownDays) {
-  switch (reason) {
-    case 'own_circle':
-      return 'You own this circle — you can\'t breach it.';
-    case 'already_member':
-      return 'You\'re already a member of this circle.';
-    case 'active_conquest':
-      return 'You already have an active conquest. Finish it first.';
-    case 'circle_under_breach':
-      return 'This circle is already under an active breach. Try again later.';
-    case 'cooldown':
-      return cooldownDays != null
-          ? 'You breached this circle recently. Try again in $cooldownDays day'
-              '${cooldownDays == 1 ? '' : 's'}.'
-          : 'You breached this circle recently. Try again later.';
-    case 'insufficient_cp':
-      return 'You don\'t have enough CP to mount this breach.';
-    default:
-      return 'You can\'t breach this circle right now.';
-  }
-}
-
-/// Shown inside CircleDetailScreen (member view) when the circle is under an
-/// active breach: lets the FIRST member to tap Defend answer it. Navigates into
-/// the breach game on success.
-class _BreachDefendBanner extends StatelessWidget {
-  final GameService service;
-  final String circleId;
-  const _BreachDefendBanner({
-    required this.service,
-    required this.circleId,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: service.openBreachesForCircleStream(circleId),
-      builder: (context, snap) {
-        final docs = snap.data?.docs ?? [];
-        if (docs.isEmpty) return const SizedBox.shrink();
-        final conquest = docs.first;
-        final conquestId = conquest.id;
-
-        return Container(
-          width: double.infinity,
-          color: scheme.errorContainer,
-          padding: const EdgeInsets.all(12),
           child: Row(
             children: [
-              Icon(Icons.shield, color: scheme.onErrorContainer),
-              const SizedBox(width: 10),
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: isDisabled
+                      ? scheme.surfaceVariant.withOpacity(0.5)
+                      : scheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Icon(
+                  icon,
+                  color: isDisabled
+                      ? scheme.outline.withOpacity(0.5)
+                      : scheme.onPrimaryContainer,
+                  size: 22,
+                ),
+              ),
+              const SizedBox(width: 16),
               Expanded(
-                child: Text(
-                  'Your circle is under breach. The first member to defend '
-                  'plays the challenger.',
-                  style: TextStyle(
-                      color: scheme.onErrorContainer, fontSize: 13),
-                ),
-              ),
-              const SizedBox(width: 8),
-              FilledButton(
-                onPressed: () async {
-                  try {
-                    final gameId =
-                        await service.acceptBreachDefense(conquestId);
-                    if (context.mounted) {
-                      Navigator.of(context).push(MaterialPageRoute(
-                        settings: const RouteSettings(name: 'game'),
-                        builder: (_) =>
-                            GameScreen(service: service, gameId: gameId),
-                      ));
-                    }
-                  } on FirebaseFunctionsException catch (e) {
-                    if (context.mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text(e.message ?? 'Failed')),
-                      );
-                    }
-                  }
-                },
-                child: const Text('Defend'),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-}
-
-/// Owner-only: when a conquest on this circle reaches `gauntlet_pending` (the
-/// challenger won the breach), the owner must nominate a champion to play the
-/// best-of-3 Gauntlet. Tapping "Nominate" opens a member picker; choosing a
-/// member calls nominateGauntletDefender, which locks their first stake and
-/// starts game 1 (both players are auto-pushed into the board by the active-
-/// games listener). Renders nothing if the viewer isn't the owner or there's
-/// no pending Gauntlet.
-class _GauntletNominateBanner extends StatelessWidget {
-  final GameService service;
-  final String circleId;
-  final String ownerId;
-  final List<String> members;
-  const _GauntletNominateBanner({
-    required this.service,
-    required this.circleId,
-    required this.ownerId,
-    required this.members,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    // Only the owner nominates.
-    if (service.uid != ownerId) return const SizedBox.shrink();
-
-    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: service.gauntletPendingForCircleStream(circleId),
-      builder: (context, snap) {
-        final docs = snap.data?.docs ?? [];
-        if (docs.isEmpty) return const SizedBox.shrink();
-        final conquest = docs.first;
-        final conquestId = conquest.id;
-        final challengerId =
-            conquest.data()['challengerId'] as String? ?? '';
-
-        return Container(
-          width: double.infinity,
-          color: scheme.tertiaryContainer,
-          padding: const EdgeInsets.all(12),
-          child: Row(
-            children: [
-              Icon(Icons.military_tech, color: scheme.onTertiaryContainer),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  'Your circle is breached — nominate your champion to defend '
-                  'the Gauntlet (best of 3).',
-                  style: TextStyle(
-                      color: scheme.onTertiaryContainer, fontSize: 13),
-                ),
-              ),
-              const SizedBox(width: 8),
-              FilledButton(
-                onPressed: () => _showNominateDialog(
-                    context, service, conquestId, challengerId, members),
-                child: const Text('Nominate'),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-}
-
-/// Member picker for the Gauntlet nomination. Lists circle members (excluding
-/// the challenger), showing name + rating; tapping one nominates them.
-Future<void> _showNominateDialog(
-  BuildContext context,
-  GameService service,
-  String conquestId,
-  String challengerId,
-  List<String> members,
-) async {
-  // Eligible nominees: members who are not the challenger.
-  final eligible = members.where((m) => m != challengerId).toList();
-  final profiles = await service.fetchProfiles(eligible);
-  if (!context.mounted) return;
-
-  await showDialog<void>(
-    context: context,
-    builder: (dialogContext) {
-      bool busy = false;
-      String? error;
-      return StatefulBuilder(
-        builder: (context, setState) {
-          return AlertDialog(
-            title: const Text('Nominate your champion'),
-            content: SizedBox(
-              width: double.maxFinite,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Text(
-                    'They play the challenger best-of-3. They stake a small '
-                    'discounted amount each game: lose a game and it burns; '
-                    'win or draw and it returns. You may nominate yourself.',
-                    style: TextStyle(fontSize: 13, color: Colors.black54),
-                  ),
-                  const SizedBox(height: 12),
-                  Flexible(
-                    child: ListView(
-                      shrinkWrap: true,
-                      children: profiles.map((p) {
-                        final uid = p['uid'] as String;
-                        final name = p['displayName'] as String? ?? 'Player';
-                        final rating = (p['rating'] as num?)?.toInt() ?? 1500;
-                        return ListTile(
-                          leading: const Icon(Icons.person),
-                          title: Text(name),
-                          trailing: Text('$rating'),
-                          onTap: busy
-                              ? null
-                              : () async {
-                                  setState(() {
-                                    busy = true;
-                                    error = null;
-                                  });
-                                  try {
-                                    final gameId = await service
-                                        .nominateGauntletDefender(
-                                      conquestId: conquestId,
-                                      defenderId: uid,
-                                    );
-                                    if (dialogContext.mounted) {
-                                      Navigator.of(dialogContext).pop();
-                                      // If the owner nominated THEMSELVES, push
-                                      // them straight into game 1 (the reliable
-                                      // path — don't depend on HomeScreen's
-                                      // auto-nav, which only fires from Home).
-                                      // A nominated OTHER member is on their own
-                                      // device; they enter via their HomeScreen
-                                      // auto-nav or the conquest prompt.
-                                      if (uid == service.uid &&
-                                          dialogContext.mounted) {
-                                        Navigator.of(dialogContext).push(
-                                          MaterialPageRoute(
-                                            settings: const RouteSettings(name: 'game'),
-                                            builder: (_) => GameScreen(
-                                              gameId: gameId,
-                                              service: service,
-                                            ),
-                                          ),
-                                        );
-                                      }
-                                    }
-                                  } on FirebaseFunctionsException catch (e) {
-                                    setState(() {
-                                      busy = false;
-                                      error = e.message ?? 'Failed';
-                                    });
-                                  }
-                                },
-                        );
-                      }).toList(),
-                    ),
-                  ),
-                  if (error != null) ...[
-                    const SizedBox(height: 8),
-                    Text(error!,
-                        style:
-                            const TextStyle(color: Colors.red, fontSize: 13)),
-                  ],
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: busy ? null : () => Navigator.of(dialogContext).pop(),
-                child: const Text('Cancel'),
-              ),
-            ],
-          );
-        },
-      );
-    },
-  );
-}
-
-/// Shows live Gauntlet series progress for any active Gauntlet on this circle
-/// (challenger X – Y defender, current game). Visible to all members so they
-/// can follow the trial. Renders nothing if no Gauntlet is active.
-class _GauntletProgressBanner extends StatelessWidget {
-  final GameService service;
-  final String circleId;
-  const _GauntletProgressBanner({
-    required this.service,
-    required this.circleId,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: service.activeGauntletForCircleStream(circleId),
-      builder: (context, snap) {
-        final docs = snap.data?.docs ?? [];
-        if (docs.isEmpty) return const SizedBox.shrink();
-        final g = docs.first.data()['gauntlet'] as Map<String, dynamic>?;
-        final cWins = (g?['challengerWins'] as num?)?.toInt() ?? 0;
-        final dWins = (g?['defenderWins'] as num?)?.toInt() ?? 0;
-
-        return Container(
-          width: double.infinity,
-          color: scheme.secondaryContainer,
-          padding: const EdgeInsets.all(12),
-          child: Row(
-            children: [
-              Icon(Icons.sports_kabaddi, color: scheme.onSecondaryContainer),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  'Gauntlet in progress — challenger $cWins : $dWins defender '
-                  '(first to 2 wins).',
-                  style: TextStyle(
-                      color: scheme.onSecondaryContainer, fontSize: 13),
-                ),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-}
-
-
-
-// =============================================================================
-// SLICE 2d: Search circles + join requests
-// =============================================================================
-
-/// Search circles by name prefix and request to join.
-class SearchCirclesScreen extends StatefulWidget {
-  final GameService service;
-  const SearchCirclesScreen({super.key, required this.service});
-  @override
-  State<SearchCirclesScreen> createState() => _SearchCirclesScreenState();
-}
-
-class _SearchCirclesScreenState extends State<SearchCirclesScreen> {
-  final _controller = TextEditingController();
-  List<Map<String, dynamic>> _results = [];
-  bool _searching = false;
-  bool _searched = false;
-
-  Future<void> _runSearch() async {
-    final q = _controller.text.trim();
-    if (q.isEmpty) return;
-    setState(() => _searching = true);
-    try {
-      final r = await widget.service.searchCircles(q);
-      if (mounted) setState(() => _results = r);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Search failed: $e')));
-      }
-    } finally {
-      if (mounted) setState(() {
-        _searching = false;
-        _searched = true;
-      });
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Find a circle')),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.all(16),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _controller,
-                    textInputAction: TextInputAction.search,
-                    onSubmitted: (_) => _runSearch(),
-                    decoration: const InputDecoration(
-                      hintText: 'Search circle name…',
-                      border: OutlineInputBorder(),
-                      prefixIcon: Icon(Icons.search),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                FilledButton(
-                  onPressed: _searching ? null : _runSearch,
-                  child: const Text('Search'),
-                ),
-              ],
-            ),
-          ),
-          if (_searching) const LinearProgressIndicator(),
-          Expanded(
-            child: !_searched
-                ? const Center(
-                    child: Text('Search for a circle by name to join.',
-                        style: TextStyle(color: Colors.black54)),
-                  )
-                : _results.isEmpty
-                    ? const Center(
-                        child: Text('No circles found.',
-                            style: TextStyle(color: Colors.black54)),
-                      )
-                    : ListView.builder(
-                        itemCount: _results.length,
-                        itemBuilder: (context, i) {
-                          final c = _results[i];
-                          return _SearchResultTile(
-                            service: widget.service,
-                            circleId: c['circleId'] as String,
-                            name: c['name'] as String? ?? 'Circle',
-                            memberCount: (c['memberCount'] ?? 0) as int,
-                          );
-                        },
-                      ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-/// A single search result with a Join / Pending / Member button that reflects
-/// the user's live relationship to the circle.
-class _SearchResultTile extends StatelessWidget {
-  final GameService service;
-  final String circleId;
-  final String name;
-  final int memberCount;
-  const _SearchResultTile({
-    required this.service,
-    required this.circleId,
-    required this.name,
-    required this.memberCount,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final myUid = service.uid;
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: service.circleStream(circleId),
-      builder: (context, circleSnap) {
-        final members = (circleSnap.data?.data()?['members'] as List?)
-                ?.cast<String>() ??
-            <String>[];
-        final isMember = members.contains(myUid);
-
-        return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-          stream: service.myJoinRequestStream(circleId),
-          builder: (context, reqSnap) {
-            final isPending = reqSnap.data?.exists ?? false;
-
-            Widget trailing;
-            if (isMember) {
-              trailing = const Chip(label: Text('Member'));
-            } else if (isPending) {
-              trailing = OutlinedButton(
-                onPressed: () async {
-                  try {
-                    await service.cancelJoinRequest(circleId);
-                  } catch (_) {}
-                },
-                child: const Text('Pending'),
-              );
-            } else {
-              trailing = Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  // Breach: opens the challenger screen (all eligibility
-                  // checks + stake preview live there). Makes the conquest
-                  // path discoverable beside Join.
-                  OutlinedButton(
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.deepOrange,
-                      side: const BorderSide(color: Colors.deepOrange),
-                    ),
-                    onPressed: () => Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => ChallengerCircleScreen(
-                          service: service,
-                          circleId: circleId,
-                          circleName: name,
-                        ),
-                      ),
-                    ),
-                    child: const Text('Breach'),
-                  ),
-                  const SizedBox(width: 8),
-                  FilledButton(
-                    onPressed: () async {
-                      try {
-                        await service.requestJoin(circleId);
-                        if (context.mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(content: Text('Request sent')));
-                        }
-                      } on FirebaseFunctionsException catch (e) {
-                        if (context.mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(content: Text(e.message ?? 'Failed')));
-                        }
-                      }
-                    },
-                    child: const Text('Join'),
-                  ),
-                ],
-              );
-            }
-
-            return ListTile(
-              leading: const Icon(Icons.groups),
-              title: Text(name),
-              subtitle: Text('$memberCount member'
-                  '${memberCount == 1 ? '' : 's'}'),
-              trailing: trailing,
-              onTap: isMember
-                  ? null
-                  : () => Navigator.of(context).push(MaterialPageRoute(
-                        builder: (_) => ChallengerCircleScreen(
-                          service: service,
-                          circleId: circleId,
-                          circleName: name,
-                        ),
-                      )),
-            );
-          },
-        );
-      },
-    );
-  }
-}
-
-/// Owner-only widget: lists pending join requests with Approve / Reject.
-class _PendingRequests extends StatelessWidget {
-  final GameService service;
-  final String circleId;
-  const _PendingRequests({required this.service, required this.circleId});
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: service.joinRequestsStream(circleId),
-      builder: (context, snap) {
-        final docs = snap.data?.docs ?? [];
-        if (docs.isEmpty) return const SizedBox.shrink();
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Divider(height: 1),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-              child: Text('Pending requests (${docs.length})',
-                  style: const TextStyle(
-                      fontWeight: FontWeight.bold, color: Colors.black87)),
-            ),
-            ...docs.map((d) {
-              final r = d.data();
-              final applicantUid = d.id;
-              final rating = (r['rating'] ?? 1500).round();
-              return ListTile(
-                dense: true,
-                leading: const Icon(Icons.person_add_alt),
-                title: Text(r['displayName'] as String? ?? 'Player'),
-                subtitle: Text('Rating $rating'),
-                trailing: Row(
-                  mainAxisSize: MainAxisSize.min,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    IconButton(
-                      tooltip: 'Approve',
-                      icon: const Icon(Icons.check, color: Colors.green),
-                      onPressed: () async {
-                        try {
-                          await service.approveJoin(circleId, applicantUid);
-                        } on FirebaseFunctionsException catch (e) {
-                          if (context.mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text(e.message ?? 'Failed')));
-                          }
-                        }
-                      },
+                    Text(
+                      label,
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                        color: isDisabled
+                            ? scheme.outline.withOpacity(0.5)
+                            : scheme.onSurface,
+                      ),
                     ),
-                    IconButton(
-                      tooltip: 'Reject',
-                      icon: const Icon(Icons.close, color: Colors.red),
-                      onPressed: () async {
-                        try {
-                          await service.rejectJoin(circleId, applicantUid);
-                        } on FirebaseFunctionsException catch (e) {
-                          if (context.mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text(e.message ?? 'Failed')));
-                          }
-                        }
-                      },
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: isDisabled
+                            ? scheme.outline.withOpacity(0.4)
+                            : scheme.outline,
+                      ),
                     ),
                   ],
                 ),
-              );
-            }),
-          ],
-        );
-      },
-    );
-  }
-}
-
-/// Dialog to propose a peer stake to a circle-mate. Issuer enters an absolute
-/// CP amount; the opponent will accept or decline. The 30%-cap and balance
-/// checks happen server-side at accept time against live balances.
-Future<void> _showStakeDialog(
-  BuildContext context,
-  GameService service, {
-  required String opponentId,
-  required String opponentName,
-  required String circleId,
-}) async {
-  final controller = TextEditingController(text: '200');
-  await showDialog<void>(
-    context: context,
-    builder: (dialogContext) {
-      String? error;
-      bool busy = false;
-      return StatefulBuilder(
-        builder: (context, setState) {
-          return AlertDialog(
-            title: Text('Stake vs $opponentName'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text(
-                  'Both players stake this amount of CP. Winner takes the pot '
-                  'minus a 5% rake. Minimum 50 CP.',
-                  style: TextStyle(fontSize: 13, color: Colors.black54),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: controller,
-                  keyboardType: TextInputType.number,
-                  decoration: InputDecoration(
-                    labelText: 'Stake (CP)',
-                    errorText: error,
-                    border: const OutlineInputBorder(),
+              ),
+              if (badge != null)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
+                  decoration: BoxDecoration(
+                    color: scheme.tertiaryContainer,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    badge!,
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: scheme.onTertiaryContainer,
+                    ),
                   ),
                 ),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: busy ? null : () => Navigator.of(dialogContext).pop(),
-                child: const Text('Cancel'),
-              ),
-              FilledButton(
-                onPressed: busy
-                    ? null
-                    : () async {
-                        final amount = int.tryParse(controller.text.trim());
-                        if (amount == null || amount < 50) {
-                          setState(() => error = 'Enter at least 50 CP');
-                          return;
-                        }
-                        setState(() {
-                          busy = true;
-                          error = null;
-                        });
-                        try {
-                          await service.proposeStake(
-                            opponentId: opponentId,
-                            circleId: circleId,
-                            amount: amount,
-                          );
-                          if (dialogContext.mounted) {
-                            Navigator.of(dialogContext).pop();
-                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                                content: Text(
-                                    'Stake offer sent to $opponentName')));
-                          }
-                        } on FirebaseFunctionsException catch (e) {
-                          setState(() {
-                            busy = false;
-                            error = e.message ?? 'Failed to send offer';
-                          });
-                        } catch (e) {
-                          // Non-Functions errors (e.g. a stale auth token throws
-                          // a platform ExecutionException "1 of 2 underlying
-                          // tasks failed"). Show a friendly, actionable message
-                          // rather than a raw Java stack trace.
-                          final raw = e.toString();
-                          final isStaleAuth = raw.contains('ExecutionException') ||
-                              raw.contains('underlying tasks failed') ||
-                              raw.contains('UNAUTHENTICATED') ||
-                              raw.contains('INVALID_REFRESH_TOKEN');
-                          setState(() {
-                            busy = false;
-                            error = isStaleAuth
-                                ? 'Session expired. Sign out and back in, then try again.'
-                                : 'Could not send offer. Please try again.';
-                          });
-                        }
-                      },
-                child: busy
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Text('Send offer'),
-              ),
-            ],
-          );
-        },
-      );
-    },
-  );
-}
-
-/// Confirmation dialog to send a challenge-up. No amount entry — stakes are
-/// computed server-side from the rating gap (CP = entry fee for a rating shot).
-Future<void> _showChallengeDialog(
-  BuildContext context,
-  GameService service, {
-  required String opponentId,
-  required String opponentName,
-  String? circleId,
-}) async {
-  await showDialog<void>(
-    context: context,
-    builder: (dialogContext) {
-      bool busy = false;
-      String? error;
-      return StatefulBuilder(
-        builder: (context, setState) {
-          return AlertDialog(
-            title: Text('Challenge $opponentName'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text(
-                  'A challenge-up is a shot at a big rating climb. The stake is '
-                  'set by the rating gap — challenging a stronger player costs '
-                  'more CP, but an upset win means a large rating jump plus the '
-                  'pot. Both stakes are calculated when they accept.',
-                  style: TextStyle(fontSize: 13, color: Colors.black54),
+              if (badge == null)
+                Icon(
+                  Icons.chevron_right,
+                  color: isDisabled
+                      ? scheme.outline.withOpacity(0.3)
+                      : scheme.outline,
                 ),
-                if (error != null) ...[
-                  const SizedBox(height: 10),
-                  Text(error!,
-                      style: const TextStyle(color: Colors.red, fontSize: 13)),
-                ],
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: busy ? null : () => Navigator.of(dialogContext).pop(),
-                child: const Text('Cancel'),
-              ),
-              FilledButton(
-                style: FilledButton.styleFrom(
-                    backgroundColor: Colors.deepOrange),
-                onPressed: busy
-                    ? null
-                    : () async {
-                        setState(() {
-                          busy = true;
-                          error = null;
-                        });
-                        try {
-                          await service.proposeChallengeUp(opponentId,
-                              circleId: circleId);
-                          if (dialogContext.mounted) {
-                            Navigator.of(dialogContext).pop();
-                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                                content:
-                                    Text('Challenge sent to $opponentName')));
-                          }
-                        } on FirebaseFunctionsException catch (e) {
-                          setState(() {
-                            busy = false;
-                            error = e.message ?? 'Failed';
-                          });
-                        }
-                      },
-                child: busy
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Text('Send challenge'),
-              ),
-            ],
-          );
-        },
-      );
-    },
-  );
-}
-
-/// Shows stake offers made TO the current user (they are the opponent), with
-/// Accept / Decline. Accepting locks both stakes, creates the game, and
-/// navigates into it.
-class _IncomingStakes extends StatelessWidget {
-  final GameService service;
-  const _IncomingStakes({required this.service});
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: service.incomingStakesStream(),
-      builder: (context, snap) {
-        final docs = snap.data?.docs ?? [];
-        if (docs.isEmpty) return const SizedBox.shrink();
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Divider(height: 1),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-              child: Text('Stake offers (${docs.length})',
-                  style: const TextStyle(
-                      fontWeight: FontWeight.bold, color: Colors.indigo)),
-            ),
-            ...docs.map((d) {
-              final s = d.data();
-              final stakeId = d.id;
-              final isChallenge = s['kind'] == 'challenge_up';
-              final amount = (s['amount'] ?? 0) as int;
-              return ListTile(
-                dense: true,
-                leading: Icon(
-                  isChallenge ? Icons.bolt : Icons.toll,
-                  color: isChallenge ? Colors.deepOrange : Colors.indigo,
-                ),
-                title: Text(isChallenge
-                    ? 'Challenge-up'
-                    : 'Stake $amount CP'),
-                subtitle: Text(isChallenge
-                    ? 'Stakes set by rating gap — tap ✓ to accept'
-                    : 'Tap ✓ to accept and start the game'),
-                trailing: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    IconButton(
-                      tooltip: 'Accept',
-                      icon: const Icon(Icons.check, color: Colors.green),
-                      onPressed: () async {
-                        try {
-                          // Accept only — entry into the board is handled
-                          // uniformly by the home screen's active-game
-                          // listener (for both the accepter and the issuer),
-                          // so we don't navigate here.
-                          if (isChallenge) {
-                            await service.acceptChallengeUp(stakeId);
-                          } else {
-                            await service.acceptStake(stakeId);
-                          }
-                          if (context.mounted) {
-                            Navigator.of(context).popUntil(
-                                (route) => route.isFirst);
-                          }
-                        } on FirebaseFunctionsException catch (e) {
-                          if (context.mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text(e.message ?? 'Failed')));
-                          }
-                        }
-                      },
-                    ),
-                    IconButton(
-                      tooltip: 'Decline',
-                      icon: const Icon(Icons.close, color: Colors.red),
-                      onPressed: () async {
-                        try {
-                          await service.declineStake(stakeId);
-                        } on FirebaseFunctionsException catch (e) {
-                          if (context.mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text(e.message ?? 'Failed')));
-                          }
-                        }
-                      },
-                    ),
-                  ],
-                ),
-              );
-            }),
-          ],
-        );
-      },
-    );
-  }
-}
-
-/// The issuer's view of their OWN pending offers (peer stakes + challenge-ups),
-/// each with a Cancel button. Cancelling retracts the offer and refunds the
-/// issuer's escrowed CP (locked at propose under the Option 3 model), via the
-/// `cancelStake` callable. Only PENDING offers appear here — once an offer is
-/// accepted it becomes a game (no cancel; play or resign), and breaches are
-/// uncancellable by design (they resolve by play or by expiry).
-class _OutgoingStakes extends StatelessWidget {
-  final GameService service;
-  const _OutgoingStakes({required this.service});
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: service.outgoingStakesStream(),
-      builder: (context, snap) {
-        final docs = snap.data?.docs ?? [];
-        if (docs.isEmpty) return const SizedBox.shrink();
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Divider(height: 1),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-              child: Text('Your open offers (${docs.length})',
-                  style: const TextStyle(
-                      fontWeight: FontWeight.bold, color: Colors.indigo)),
-            ),
-            ...docs.map((d) {
-              final s = d.data();
-              final stakeId = d.id;
-              final isChallenge = s['kind'] == 'challenge_up';
-              // Peer offers carry `amount`; challenge-ups carry the fixed
-              // `issuerStake` (the CP you've escrowed for this challenge).
-              final locked = isChallenge
-                  ? (s['issuerStake'] ?? 0) as int
-                  : (s['amount'] ?? 0) as int;
-              return ListTile(
-                dense: true,
-                leading: Icon(
-                  isChallenge ? Icons.bolt : Icons.toll,
-                  color: isChallenge ? Colors.deepOrange : Colors.indigo,
-                ),
-                title: Text(isChallenge ? 'Challenge-up' : 'Stake $locked CP'),
-                subtitle: Text(
-                    'Awaiting response · $locked CP held — cancel to refund'),
-                trailing: TextButton.icon(
-                  icon: const Icon(Icons.undo, size: 18),
-                  label: const Text('Cancel'),
-                  onPressed: () async {
-                    try {
-                      await service.cancelStake(stakeId);
-                      if (context.mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                            content: Text('Offer cancelled — CP refunded.')));
-                      }
-                    } on FirebaseFunctionsException catch (e) {
-                      if (context.mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(content: Text(e.message ?? 'Failed')));
-                      }
-                    }
-                  },
-                ),
-              );
-            }),
-          ],
-        );
-      },
-    );
-  }
-}
-
-/// The OPEN LOBBY — staked play with strangers, outside any circle.
-/// Shows all open seats anyone can accept (each is a "outside"/"open" stake),
-/// a button to post your own seat, and (if you have one) your own open seat with
-/// a Cancel button. Accepting computes asymmetric stakes by rating and creates a
-/// game; the player then enters via the usual waiting banner ("always tap Enter"
-/// flow), so this screen doesn't navigate to the board itself.
-class LobbyScreen extends StatelessWidget {
-  final GameService service;
-  const LobbyScreen({super.key, required this.service});
-
-  Future<void> _post(BuildContext context) async {
-    // Read the poster's live balance to bound the picker (200 .. 40% cap, in 50s).
-    final me = await service.myRatingRdCp();
-    final maxStake = GameService.lobbyPosterMaxStake(me.cp);
-    if (!context.mounted) return;
-    if (maxStake < GameService.lobbyStakeFloor) {
-      // Their 40% cap can't reach the 200 floor → can't post yet.
-      final need =
-          (GameService.lobbyStakeFloor / GameService.lobbyMaxStakeFraction)
-              .ceil();
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(
-              'You need at least $need CP to post a seat. You have ${me.cp} CP — '
-              'play a few games for your daily CP.')));
-      return;
-    }
-
-    final chosen = await showDialog<int>(
-      context: context,
-      builder: (ctx) {
-        int stake = GameService.lobbyStakeFloor; // default to the floor (200)
-        return StatefulBuilder(
-          builder: (ctx, setState) => AlertDialog(
-            title: const Text('Post a lobby seat'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                    'Choose how much CP you risk. The challenger matches you '
-                    'based on the rating gap — a stronger challenger stakes more.'),
-                const SizedBox(height: 16),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    IconButton(
-                      icon: const Icon(Icons.remove_circle_outline),
-                      onPressed: stake > GameService.lobbyStakeFloor
-                          ? () => setState(() =>
-                              stake -= GameService.lobbyStakeStep)
-                          : null,
-                    ),
-                    Text('$stake CP',
-                        style: const TextStyle(
-                            fontSize: 22, fontWeight: FontWeight.bold)),
-                    IconButton(
-                      icon: const Icon(Icons.add_circle_outline),
-                      onPressed: stake < maxStake
-                          ? () => setState(() =>
-                              stake += GameService.lobbyStakeStep)
-                          : null,
-                    ),
-                  ],
-                ),
-                Center(
-                  child: Text('Max $maxStake CP (40% of your balance)',
-                      style: const TextStyle(
-                          color: Colors.black54, fontSize: 12)),
-                ),
-              ],
-            ),
-            actions: [
-              TextButton(
-                  onPressed: () => Navigator.pop(ctx),
-                  child: const Text('Cancel')),
-              FilledButton(
-                  onPressed: () => Navigator.pop(ctx, stake),
-                  child: const Text('Post seat')),
-            ],
-          ),
-        );
-      },
-    );
-    if (chosen == null || !context.mounted) return;
-
-    try {
-      await service.postLobbySeat(chosen);
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(
-                'Seat posted for $chosen CP. Waiting for someone to join…')));
-      }
-    } on FirebaseFunctionsException catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.message ?? 'Failed')));
-      }
-    }
-  }
-
-  Future<void> _accept(
-    BuildContext context,
-    String seatId,
-    Map<String, dynamic> seat,
-  ) async {
-    // Compute a client-side preview of what the accepter risks vs the poster,
-    // so the player sees the deal BEFORE committing. The server recomputes
-    // authoritatively on accept (so these are '~' estimates).
-    final me = await service.myRatingRdCp();
-    if (!context.mounted) return;
-
-    int asInt(dynamic v, int dflt) =>
-        v is int ? v : (v is num ? v.toInt() : dflt);
-    final posterStake = asInt(seat['posterStake'], 0);
-    final posterRating = asInt(seat['posterRating'], 1500);
-    final posterRd = asInt(seat['posterRd'], 350);
-
-    // Legacy seat (pre-redesign) with no posterStake: skip the preview, let the
-    // server decide. (Test data is wiped, so this is just defensive.)
-    if (posterStake <= 0) {
-      await _doAccept(context, seatId);
-      return;
-    }
-
-    final yourStake = GameService.lobbyAccepterStakePreview(
-      posterStake: posterStake,
-      accepterRating: me.rating,
-      accepterRd: me.rd,
-      posterRating: posterRating,
-      posterRd: posterRd,
-      accepterBalance: me.cp,
-    );
-
-    // Can't afford the required minimum (40% cap below the floor, or below the
-    // computed stake): tell them, don't open the accept.
-    if (yourStake < GameService.lobbyStakeFloor || me.cp < yourStake) {
-      final need =
-          (GameService.lobbyStakeFloor / GameService.lobbyMaxStakeFraction)
-              .ceil();
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(
-              'You need at least $need CP to accept this seat. You have ${me.cp} CP.')));
-      return;
-    }
-
-    final pot = yourStake + posterStake;
-    final rake = (pot * 0.05).round();
-    final ifWin = pot - rake - yourStake; // net gain if you win
-    final favored = me.rating >= posterRating;
-
-    final go = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Accept this seat?'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Opponent rating $posterRating'),
-            const Divider(height: 20),
-            _row('You risk', '~$yourStake CP'),
-            _row('They risk', '$posterStake CP'),
-            _row('If you win', '~+$ifWin CP'),
-            _row('If you lose', '−$yourStake CP'),
-            const SizedBox(height: 8),
-            Text(
-              favored
-                  ? "You're favored to win this one."
-                  : "You're the underdog — a win means a bigger rating gain.",
-              style: const TextStyle(color: Colors.black54, fontSize: 12),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Accept')),
-        ],
-      ),
-    );
-    if (go == true && context.mounted) {
-      await _doAccept(context, seatId);
-    }
-  }
-
-  static Widget _row(String label, String value) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 2),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Text(label, style: const TextStyle(color: Colors.black54)),
-            Text(value, style: const TextStyle(fontWeight: FontWeight.bold)),
-          ],
-        ),
-      );
-
-  Future<void> _doAccept(BuildContext context, String seatId) async {
-    try {
-      final r = await service.acceptLobbySeat(seatId);
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(
-                'Joined! You staked ${r['accepterStake']} CP. Tap Enter to start.')));
-      }
-    } on FirebaseFunctionsException catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.message ?? 'Failed')));
-      }
-    }
-  }
-
-  Future<void> _cancel(BuildContext context, String seatId) async {
-    try {
-      await service.cancelLobbySeat(seatId);
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Seat withdrawn.')));
-      }
-    } on FirebaseFunctionsException catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.message ?? 'Failed')));
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final myUid = service.uid;
-    return Scaffold(
-      appBar: AppBar(title: const Text('Open Lobby')),
-      body: Column(
-        children: [
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
-            child: Text(
-              'Stake CP against anyone. Stakes scale by rating — the lower-rated '
-              'player risks less. You only commit CP when a game starts.',
-              style: TextStyle(color: Colors.black54),
-            ),
-          ),
-          Expanded(
-            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-              stream: service.openLobbySeatsStream(),
-              builder: (context, snap) {
-                if (snap.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-                final docs = snap.data?.docs ?? [];
-                if (docs.isEmpty) {
-                  return const Center(
-                    child: Padding(
-                      padding: EdgeInsets.all(32),
-                      child: Text(
-                        'No open seats right now.\nPost one and wait for a '
-                        'challenger, or check back soon.',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(color: Colors.black54),
-                      ),
-                    ),
-                  );
-                }
-                // Sort: my own seat first (so I can cancel it), then by newest.
-                final mine = docs.where((d) => d.data()['issuerId'] == myUid);
-                final others =
-                    docs.where((d) => d.data()['issuerId'] != myUid).toList();
-                final ordered = [...mine, ...others];
-
-                return ListView.separated(
-                  itemCount: ordered.length,
-                  separatorBuilder: (_, __) => const Divider(height: 1),
-                  itemBuilder: (context, i) {
-                    final d = ordered[i];
-                    final s = d.data();
-                    final seatId = d.id;
-                    final isMine = s['issuerId'] == myUid;
-                    final rating = (s['posterRating'] ?? 1500);
-                    final ratingStr = (rating is num)
-                        ? rating.round().toString()
-                        : rating.toString();
-                    final pStake = s['posterStake'];
-                    final stakeStr =
-                        (pStake is num) ? pStake.round().toString() : null;
-
-                    if (isMine) {
-                      return ListTile(
-                        leading: const CircleAvatar(
-                          backgroundColor: Color(0xFFE8EAF6),
-                          child: Icon(Icons.person, color: Colors.indigo),
-                        ),
-                        title: const Text('Your open seat'),
-                        subtitle: Text(stakeStr != null
-                            ? 'You staked $stakeStr CP · rating $ratingStr · waiting for a challenger'
-                            : 'Rating $ratingStr · waiting for a challenger'),
-                        trailing: TextButton.icon(
-                          icon: const Icon(Icons.close, size: 18),
-                          label: const Text('Cancel'),
-                          onPressed: () => _cancel(context, seatId),
-                        ),
-                      );
-                    }
-                    return ListTile(
-                      leading: const CircleAvatar(
-                        backgroundColor: Color(0xFFE3F2FD),
-                        child: Icon(Icons.public, color: Colors.blue),
-                      ),
-                      title: stakeStr != null
-                          ? Text('Open seat · $stakeStr CP · rating $ratingStr')
-                          : Text('Open seat · rating $ratingStr'),
-                      subtitle: const Text(
-                          'Tap Join to see what you risk before committing'),
-                      trailing: FilledButton(
-                        onPressed: () => _accept(context, seatId, s),
-                        child: const Text('Join'),
-                      ),
-                    );
-                  },
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => _post(context),
-        icon: const Icon(Icons.add),
-        label: const Text('Post a seat'),
-      ),
-    );
-  }
-}
-
-/// Two-tab leaderboard screen: Players (by rating) and Circles (by top-quartile
-/// score). Both read a single precomputed doc each (written hourly by the
-/// refreshLeaderboards Cloud Function), so this is one cheap read per tab.
-/// Reached via the "Leaderboards" button on the home screen.
-class LeaderboardScreen extends StatelessWidget {
-  final GameService service;
-  const LeaderboardScreen({super.key, required this.service});
-
-  @override
-  Widget build(BuildContext context) {
-    return DefaultTabController(
-      length: 2,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('Leaderboards'),
-          bottom: const TabBar(
-            tabs: [
-              Tab(text: 'Players'),
-              Tab(text: 'Circles'),
             ],
           ),
         ),
-        body: TabBarView(
-          children: [
-            _PlayerBoard(service: service),
-            _CircleBoard(service: service),
-          ],
-        ),
       ),
     );
   }
-}
-
-/// Empty/loading helper shared by both boards.
-Widget _boardEmpty(String msg) => Center(
-      child: Padding(
-        padding: const EdgeInsets.all(32),
-        child: Text(msg,
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: Colors.black54)),
-      ),
-    );
-
-class _PlayerBoard extends StatelessWidget {
-  final GameService service;
-  const _PlayerBoard({required this.service});
-
-  @override
-  Widget build(BuildContext context) {
-    final myUid = service.uid;
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: service.playerLeaderboardStream(),
-      builder: (context, snap) {
-        if (snap.connectionState == ConnectionState.waiting) {
-          return const Center(child: CircularProgressIndicator());
-        }
-        final data = snap.data?.data();
-        final entries =
-            (data?['entries'] as List?)?.cast<Map<String, dynamic>>() ?? [];
-        if (entries.isEmpty) {
-          return _boardEmpty(
-              'No ranked players yet.\nPlayers appear here after 10 rated games.');
-        }
-        return ListView.separated(
-          itemCount: entries.length,
-          separatorBuilder: (_, __) => const Divider(height: 1),
-          itemBuilder: (context, i) {
-            final e = entries[i];
-            final isMe = e['uid'] == myUid;
-            final rank = i + 1;
-            return Container(
-              color: isMe ? const Color(0xFFF1F8E9) : null,
-              child: ListTile(
-                leading: _rankBadge(rank),
-                title: Text(
-                  (e['displayName'] ?? 'Player').toString(),
-                  style: TextStyle(
-                      fontWeight: isMe ? FontWeight.bold : FontWeight.normal),
-                ),
-                subtitle: Text('${e['gamesPlayed'] ?? 0} games'),
-                trailing: Text(
-                  '${(e['rating'] as num?)?.round() ?? '-'}',
-                  style: const TextStyle(
-                      fontWeight: FontWeight.bold, fontSize: 16),
-                ),
-              ),
-            );
-          },
-        );
-      },
-    );
-  }
-}
-
-class _CircleBoard extends StatelessWidget {
-  final GameService service;
-  const _CircleBoard({required this.service});
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: service.circleLeaderboardStream(),
-      builder: (context, snap) {
-        if (snap.connectionState == ConnectionState.waiting) {
-          return const Center(child: CircularProgressIndicator());
-        }
-        final data = snap.data?.data();
-        final entries =
-            (data?['entries'] as List?)?.cast<Map<String, dynamic>>() ?? [];
-        if (entries.isEmpty) {
-          return _boardEmpty(
-              'No ranked circles yet.\nCircles appear here once they have 10+ '
-              'members with enough rated players.');
-        }
-        return ListView.separated(
-          itemCount: entries.length,
-          separatorBuilder: (_, __) => const Divider(height: 1),
-          itemBuilder: (context, i) {
-            final e = entries[i];
-            final rank = i + 1;
-            return ListTile(
-              leading: _rankBadge(rank),
-              title: Text(
-                (e['name'] ?? 'Circle').toString(),
-                style: const TextStyle(fontWeight: FontWeight.w600),
-              ),
-              subtitle: Text('${e['memberCount'] ?? 0} members · '
-                  'top ${e['quartileCount'] ?? 0} avg'),
-              trailing: Text(
-                '${(e['score'] as num?)?.round() ?? '-'}',
-                style:
-                    const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-              ),
-            );
-          },
-        );
-      },
-    );
-  }
-}
-
-/// A small rank badge (gold/silver/bronze for the top 3, plain otherwise).
-Widget _rankBadge(int rank) {
-  Color bg;
-  switch (rank) {
-    case 1:
-      bg = const Color(0xFFFFD54F); // gold
-      break;
-    case 2:
-      bg = const Color(0xFFB0BEC5); // silver
-      break;
-    case 3:
-      bg = const Color(0xFFBCAAA4); // bronze
-      break;
-    default:
-      bg = const Color(0xFFE0E0E0);
-  }
-  return CircleAvatar(
-    backgroundColor: bg,
-    radius: 18,
-    child: Text('$rank',
-        style: const TextStyle(
-            fontWeight: FontWeight.bold, color: Colors.black87)),
-  );
 }
